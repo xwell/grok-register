@@ -20,5 +20,15 @@
   "defaultDomains": "example.com",
   "email_provider": "cloudflare",
   "yyds_api_key": "",
-  "yyds_jwt": ""
+  "yyds_jwt": "",
+  "freemail_api_base": "",
+  "freemail_admin_token": "",
+  "freemail_domains": [{"domain": "example.com", "weight": 3}, {"domain": "example.org", "weight": 1}],
+  "freemail_domain": "",
+  "proxy_pool": [],
+  "proxy_mode": "fixed",
+  "register_proxy_cooldown_seconds": 180,
+  "register_proxy_pool_random_start": true,
+  "browser_path": "",
+  "headless": null
 }

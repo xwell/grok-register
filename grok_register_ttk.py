@@ -5,8 +5,14 @@ Grok 注册机 - TTK GUI 版本
 整合 DrissionPage_example.py, openai_register.py, batch_open_nsfw.py
 """
 
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox, scrolledtext
+except ImportError:  # 无头环境（如精简镜像 CI）没有 tkinter；CLI 模式不依赖它
+    tk = None
+    ttk = None
+    messagebox = None
+    scrolledtext = None
 import threading
 import datetime
 import time
@@ -20,6 +26,15 @@ import random
 import re
 import string
 import json
+import atexit
+import select
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlsplit
+
+try:
+    import socks  # PySocks，仅 SOCKS5 认证桥需要
+except Exception:  # pragma: no cover - PySocks 未安装时桥功能不可用但整体不崩
+    socks = None
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
@@ -58,6 +73,24 @@ DEFAULT_CONFIG = {
     "grok2api_auto_add_remote": False,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
+    "defaultDomains": "example.com",
+    "email_provider": "cloudflare",
+    "yyds_api_key": "",
+    "yyds_jwt": "",
+    # FreeMail 邮箱
+    "freemail_api_base": "",
+    "freemail_admin_token": "",
+    # 结构化: [{"domain":"a.com","weight":3},{"domain":"b.com","weight":1}]；兼容逗号分隔字符串
+    "freemail_domains": [],
+    "freemail_domain": "",
+    # 代理池（用于浏览器注册阶段）
+    "proxy_pool": [],
+    "proxy_mode": "fixed",  # fixed=沿用 proxy 单节点 | pool=启用代理池轮换
+    "register_proxy_cooldown_seconds": 180,
+    "register_proxy_pool_random_start": True,
+    # 浏览器（Linux 服务器需要指定 Chrome/Chromium 路径）
+    "browser_path": "",
+    "headless": None,  # None/False=非 headless（默认，Turnstile 需真实 DOM，Linux 用 xvfb）；True=无头
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -142,6 +175,504 @@ def get_proxies():
     if proxy:
         return {"http": proxy, "https": proxy}
     return {}
+
+
+# ===== 代理池（浏览器注册阶段） =====
+
+PROXY_POOL_TASK_PROXY = "pool://"
+
+
+def _get_proxy_pool_config():
+    """解析 proxy_pool 配置为去重后的代理字符串列表。"""
+    raw = config.get("proxy_pool", [])
+    if isinstance(raw, list):
+        candidates = raw
+    elif isinstance(raw, str):
+        candidates = raw.replace("\r", "\n").replace("，", "\n").replace(",", "\n").split("\n")
+    else:
+        candidates = []
+    pool = []
+    seen = set()
+    for item in candidates:
+        value = str(item or "").strip()
+        if not value or value in seen:
+            continue
+        pool.append(value)
+        seen.add(value)
+    return pool
+
+
+def get_proxy_mode():
+    return str(config.get("proxy_mode", "fixed") or "fixed").strip().lower()
+
+
+def normalize_requests_proxy(proxy):
+    """归一化代理字符串供 requests/curl_cffi 使用：socks5:// 自动转 socks5h:// 走远端 DNS。"""
+    if not proxy:
+        return None
+    value = str(proxy).strip()
+    if not value:
+        return None
+    if "://" not in value:
+        value = f"http://{value}"
+    if value.startswith("socks5://"):
+        value = "socks5h://" + value[len("socks5://"):]
+    return value
+
+
+def normalize_browser_proxy(proxy):
+    """归一化代理字符串供浏览器使用：socks5h:// 转回 socks5://（Chromium 不认 socks5h）。"""
+    if not proxy:
+        return None
+    value = str(proxy).strip()
+    if not value:
+        return None
+    if value.startswith("socks5h://"):
+        value = "socks5://" + value[len("socks5h://"):]
+    if "://" not in value:
+        value = f"http://{value}"
+    return value
+
+
+def mask_proxy(proxy):
+    """脱敏打印代理，隐藏用户名密码。"""
+    if not proxy:
+        return "direct"
+    value = str(proxy).strip()
+    if "://" not in value:
+        value = f"http://{value}"
+    try:
+        parsed = urlsplit(value)
+        if parsed.hostname:
+            host = parsed.hostname
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            port = f":{parsed.port}" if parsed.port else ""
+            auth = " (auth)" if parsed.username or parsed.password else ""
+            return f"{parsed.scheme}://{host}{port}{auth}"
+    except Exception:
+        pass
+    return "<invalid proxy>"
+
+
+class _QuietDisconnectThreadingHTTPServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
+
+
+class _PlaywrightSocksProxyHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        return
+
+    def do_CONNECT(self):
+        self.server.bridge.handle_connect(self)
+
+    def do_GET(self):
+        self.server.bridge.handle_http(self)
+
+    def do_POST(self):
+        self.server.bridge.handle_http(self)
+
+    def do_PUT(self):
+        self.server.bridge.handle_http(self)
+
+    def do_PATCH(self):
+        self.server.bridge.handle_http(self)
+
+    def do_DELETE(self):
+        self.server.bridge.handle_http(self)
+
+    def do_HEAD(self):
+        self.server.bridge.handle_http(self)
+
+    def do_OPTIONS(self):
+        self.server.bridge.handle_http(self)
+
+
+class _PlaywrightSocksProxyBridge:
+    """本地 HTTP→SOCKS5 认证桥：Chromium 不支持 socks5 URL 内嵌认证，
+    通过在 127.0.0.1 起一个本地 HTTP 代理，把 CONNECT/HTTP 请求用 PySocks 转发到
+    上游带认证的 SOCKS5 节点，对浏览器暴露一个无认证的 http://127.0.0.1:<port>。
+    """
+
+    def __init__(self, proxy):
+        self.proxy = proxy
+        self._server = None
+        self._start_lock = threading.Lock()
+        self._thread = None
+        value = str(proxy or "").strip()
+        if "://" not in value:
+            value = f"socks5://{value}"
+        parsed = urlsplit(value)
+        self._scheme = (parsed.scheme or "socks5").lower()
+        self._upstream_host = parsed.hostname
+        self._upstream_port = parsed.port or 1080
+        self._username = unquote(parsed.username) if parsed.username else None
+        self._password = unquote(parsed.password) if parsed.password else None
+
+    @property
+    def server_url(self):
+        self.start()
+        return f"http://127.0.0.1:{self._server.server_port}"
+
+    def start(self):
+        if self._server and self._thread and self._thread.is_alive():
+            return
+        with self._start_lock:
+            if self._server and self._thread and self._thread.is_alive():
+                return
+            server = _QuietDisconnectThreadingHTTPServer(("127.0.0.1", 0), _PlaywrightSocksProxyHandler)
+            server.daemon_threads = True
+            server.allow_reuse_address = True
+            server.bridge = self
+            thread = threading.Thread(
+                target=server.serve_forever,
+                name=f"playwright-socks-bridge-{server.server_port}",
+                daemon=True,
+            )
+            thread.start()
+            self._server = server
+            self._thread = thread
+            print(f"[ProxyBridge] SOCKS5 认证桥已启动: {mask_proxy(self.proxy)} -> http://127.0.0.1:{server.server_port}")
+
+    def close(self):
+        server = self._server
+        if not server:
+            return
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+        try:
+            server.server_close()
+        except Exception:
+            pass
+        self._server = None
+        self._thread = None
+
+    def handle_connect(self, handler):
+        upstream = None
+        try:
+            host, port = _split_host_port(handler.path, 443)
+            if not host:
+                handler.send_error(400, "Invalid CONNECT target")
+                return
+            upstream = self._open_upstream_socket(host, port)
+            handler.connection.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            self._relay_bidirectional(handler.connection, upstream)
+        except Exception as exc:
+            try:
+                handler.send_error(502, f"Proxy connect failed: {exc}")
+            except Exception:
+                pass
+        finally:
+            if upstream:
+                try:
+                    upstream.close()
+                except Exception:
+                    pass
+
+    def handle_http(self, handler):
+        upstream = None
+        try:
+            host, port, path = _parse_http_target(handler.path, handler.headers.get("Host"))
+            if not host:
+                handler.send_error(400, "Invalid target host")
+                return
+            body = b""
+            content_length = handler.headers.get("Content-Length")
+            if content_length:
+                body = handler.rfile.read(int(content_length))
+            upstream = self._open_upstream_socket(host, port)
+            upstream.sendall(self._build_forward_request(handler, host, path, body))
+            self._relay_response(upstream, handler.connection)
+        except Exception as exc:
+            try:
+                handler.send_error(502, f"Proxy request failed: {exc}")
+            except Exception:
+                pass
+        finally:
+            if upstream:
+                try:
+                    upstream.close()
+                except Exception:
+                    pass
+
+    def _open_upstream_socket(self, host, port):
+        if socks is None:
+            raise RuntimeError("PySocks 未安装，无法转发到 SOCKS5 上游")
+        if not self._upstream_host:
+            raise RuntimeError("SOCKS5 上游 host 为空")
+        upstream = socks.socksocket()
+        upstream.settimeout(30)
+        proxy_type = socks.SOCKS5 if self._scheme.startswith("socks5") else socks.HTTP
+        upstream.set_proxy(
+            proxy_type,
+            self._upstream_host,
+            self._upstream_port,
+            username=self._username,
+            password=self._password,
+            rdns=True,
+        )
+        upstream.connect((host, port))
+        upstream.settimeout(None)
+        return upstream
+
+    def _build_forward_request(self, handler, host, path, body):
+        request_line = f"{handler.command} {path} {handler.request_version}\r\n"
+        headers = []
+        has_host = False
+        for key, value in handler.headers.items():
+            lowered = key.lower()
+            if lowered in {"proxy-authorization", "proxy-connection", "connection"}:
+                continue
+            if lowered == "host":
+                has_host = True
+            headers.append(f"{key}: {value}\r\n")
+        if not has_host:
+            headers.append(f"Host: {host}\r\n")
+        headers.append("Connection: close\r\n")
+        headers.append("\r\n")
+        raw = request_line.encode("utf-8")
+        raw += "".join(headers).encode("utf-8")
+        raw += body
+        return raw
+
+    def _relay_bidirectional(self, client_sock, upstream_sock):
+        sockets = [client_sock, upstream_sock]
+        while True:
+            readable, _, _ = select.select(sockets, [], [], 60)
+            if not readable:
+                continue
+            for source in readable:
+                data = source.recv(65536)
+                if not data:
+                    return
+                target = upstream_sock if source is client_sock else client_sock
+                target.sendall(data)
+
+    def _relay_response(self, upstream_sock, client_sock):
+        while True:
+            data = upstream_sock.recv(65536)
+            if not data:
+                return
+            client_sock.sendall(data)
+
+
+_playwright_proxy_bridge_lock = threading.Lock()
+_playwright_proxy_bridges = {}
+
+
+def _should_bridge_proxy(parsed):
+    scheme = str(parsed.scheme or "").strip().lower()
+    return scheme.startswith("socks5") and bool(parsed.username or parsed.password)
+
+
+def _get_playwright_proxy_bridge(proxy):
+    key = str(proxy or "").strip()
+    with _playwright_proxy_bridge_lock:
+        bridge = _playwright_proxy_bridges.get(key)
+        if bridge is None:
+            bridge = _PlaywrightSocksProxyBridge(key)
+            _playwright_proxy_bridges[key] = bridge
+    bridge.start()
+    return bridge
+
+
+def _cleanup_playwright_proxy_bridges():
+    with _playwright_proxy_bridge_lock:
+        bridges = list(_playwright_proxy_bridges.values())
+        _playwright_proxy_bridges.clear()
+    for bridge in bridges:
+        try:
+            bridge.close()
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup_playwright_proxy_bridges)
+
+
+def _split_host_port(target, default_port):
+    value = str(target or "").strip()
+    if not value:
+        return None, default_port
+    parsed = urlsplit(value if "://" in value else f"//{value}")
+    try:
+        port = parsed.port or default_port
+    except ValueError:
+        return None, default_port
+    return parsed.hostname, port
+
+
+def _parse_http_target(path, host_header):
+    parsed = urlsplit(path)
+    if parsed.scheme and parsed.hostname:
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        clean_path = parsed.path or "/"
+        if parsed.query:
+            clean_path = f"{clean_path}?{parsed.query}"
+        return host, port, clean_path
+    host, port = _split_host_port(host_header, 80)
+    clean_path = path if path.startswith("/") else f"/{path}"
+    return host, port, clean_path
+
+
+def build_browser_proxy_config(proxy):
+    """把代理字符串转换为 ChromiumOptions.set_proxy 能用的形态。
+
+    - http/https/socks5 无认证：直接用 socks5h→socks5 归一化后的 URL。
+    - socks5 带认证：走本地认证桥，对浏览器暴露 http://127.0.0.1:<port>。
+    返回 None 表示直连。
+    """
+    if not proxy:
+        return None
+    value = str(proxy).strip()
+    if not value:
+        return None
+    if value.startswith("socks5h://"):
+        value = "socks5://" + value[len("socks5h://"):]
+    if "://" not in value:
+        value = f"http://{value}"
+    parsed = urlsplit(value)
+    if _should_bridge_proxy(parsed):
+        bridge = _get_playwright_proxy_bridge(value)
+        return bridge.server_url
+    return value
+
+
+class ProxyPoolWithCooldown:
+    """带冷却期的代理池分配器（移植自 codex_heroSMS）。
+
+    每个代理两次分配间至少间隔 cooldown_seconds 秒；acquire() 取"最久未使用"
+    的代理（LRU），从 start_offset 起环形遍历打破平局，使多账号在池内均匀轮转。
+    """
+
+    def __init__(self, proxies, cooldown_seconds=180, start_offset=0):
+        if not proxies:
+            raise ValueError("代理池不能为空")
+        self._proxies = list(proxies)
+        self._cooldown = max(0, cooldown_seconds)
+        self._last_used = [0.0] * len(proxies)
+        self._use_counts = [0] * len(proxies)
+        self._lock = threading.Lock()
+        self._start_offset = max(0, min(start_offset, len(proxies) - 1))
+
+    @property
+    def pool_size(self):
+        return len(self._proxies)
+
+    @property
+    def start_offset(self):
+        return self._start_offset
+
+    def _iter_indices(self):
+        n = len(self._proxies)
+        for i in range(n):
+            yield (self._start_offset + i) % n
+
+    def acquire(self):
+        """返回 dict: {value, slot, label, cooldown_remaining}。"""
+        with self._lock:
+            now = time.time()
+            best_idx = -1
+            best_last = None
+            for i in self._iter_indices():
+                last = self._last_used[i]
+                if best_last is None or last < best_last:
+                    best_last = last
+                    best_idx = i
+            if best_idx < 0:
+                best_idx = self._start_offset
+            waited = max(0.0, self._cooldown - (now - self._last_used[best_idx]))
+            if waited > 0:
+                time.sleep(waited)
+                now = time.time()
+            self._last_used[best_idx] = now
+            self._use_counts[best_idx] += 1
+            value = self._proxies[best_idx]
+            return {
+                "value": value,
+                "slot": best_idx,
+                "label": f"代理 {best_idx + 1}/{len(self._proxies)} · {mask_proxy(value)}",
+                "cooldown_remaining": round(waited, 1),
+            }
+
+
+def _probe_proxy_ok(proxy, timeout=15):
+    """对单个代理做轻量探测：grok.com + accounts.x.ai 至少一个返回 <500 即视为可用。"""
+    proxies = {"http": normalize_requests_proxy(proxy), "https": normalize_requests_proxy(proxy)}
+    test_urls = [
+        "https://grok.com/",
+        "https://accounts.x.ai/",
+    ]
+    for url in test_urls:
+        try:
+            resp = requests.get(url, proxies=proxies, timeout=timeout, allow_redirects=True)
+            if resp.status_code < 500:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def build_registration_proxy_plan(log_callback=None):
+    """批次前对代理池做健康预检，返回 (ok, healthy_proxies, log_lines)。
+
+    - proxy_mode != pool 或池为空：返回 (True, [], [])，由调用方按 fixed 模式处理。
+    - 池模式：逐个探测，剔除不可用节点；全部失败则 ok=False。
+    """
+    log_lines = []
+    if get_proxy_mode() != "pool":
+        return True, [], log_lines
+    pool = _get_proxy_pool_config()
+    if not pool:
+        log_lines.append("[Preflight] 代理模式为 pool 但池为空")
+        return False, [], log_lines
+    healthy = []
+    for proxy in pool:
+        ok = _probe_proxy_ok(proxy)
+        status = "通过" if ok else "失败"
+        line = f"[Preflight] {mask_proxy(proxy)} · {status}"
+        log_lines.append(line)
+        if log_callback:
+            log_callback(line)
+        if ok:
+            healthy.append(proxy)
+    if not healthy:
+        summary = f"代理池预检全部失败（{len(pool)} 个节点）"
+        log_lines.append(f"[Preflight] {summary}")
+        return False, healthy, log_lines
+    log_lines.append(f"[Preflight] 代理池可用 {len(healthy)}/{len(pool)} 个节点")
+    return True, healthy, log_lines
+
+
+def _init_proxy_pool(log_callback=None):
+    """批次前预检并构造代理池分配器；非池模式返回 None。
+
+    预检过程中每个节点的结果已由 build_registration_proxy_plan 通过
+    log_callback 实时打印，这里不再重复回放 log_lines。
+    """
+    if get_proxy_mode() != "pool":
+        return None
+    ok, healthy, _log_lines = build_registration_proxy_plan(log_callback=log_callback)
+    if not ok:
+        raise RuntimeError("代理池预检失败，未发现可用节点")
+    if not healthy:
+        return None
+    try:
+        cooldown = int(config.get("register_proxy_cooldown_seconds", 180))
+    except (TypeError, ValueError):
+        cooldown = 180
+    random_start = bool(config.get("register_proxy_pool_random_start", True))
+    start_offset = random.randint(0, len(healthy) - 1) if random_start and len(healthy) > 1 else 0
+    return ProxyPoolWithCooldown(healthy, cooldown_seconds=cooldown, start_offset=start_offset)
 
 
 def get_duckmail_api_key():
@@ -374,10 +905,68 @@ def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
                 log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
 
 
-def create_browser_options():
+_LINUX_BROWSER_CANDIDATES = [
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/snap/bin/chromium",
+    "/opt/google/chrome/chrome",
+    "/usr/bin/brave-browser",
+]
+
+
+def _resolve_browser_path():
+    """返回用户配置的浏览器路径；未配置则在常见 Linux 路径中探测。"""
+    configured = str(config.get("browser_path", "") or "").strip()
+    if configured and os.path.isfile(configured):
+        return configured
+    if configured:
+        # 用户显式配置但文件不存在，原样返回交给 DrissionPage 报错
+        return configured
+    for candidate in _LINUX_BROWSER_CANDIDATES:
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def create_browser_options(proxy=None):
     options = ChromiumOptions()
     options.auto_port()
     options.set_timeouts(base=1)
+    is_linux = sys.platform.startswith("linux")
+    # 默认非 headless：grok 注册含 Turnstile 人机验证，headless 下通过率极低。
+    # Linux 服务器无显示器时配合 xvfb 虚拟显卡跑（见 main_cli 的 xvfb 包装）。
+    headless_cfg = config.get("headless", None)
+    if headless_cfg is None or headless_cfg == "":
+        headless = False  # 默认非 headless，需要 Turnstile 的真实 DOM 环境
+    else:
+        headless = bool(headless_cfg)
+    if is_linux:
+        browser_path = _resolve_browser_path()
+        if browser_path:
+            try:
+                options.set_browser_path(browser_path)
+            except Exception:
+                pass
+        # 服务器/root 环境必需的运行参数
+        try:
+            options.set_argument("--no-sandbox")
+            options.set_argument("--disable-dev-shm-usage")
+            options.set_argument("--disable-gpu")
+        except Exception:
+            pass
+        if headless:
+            try:
+                options.headless(True)
+            except Exception:
+                try:
+                    options.set_argument("--headless=new")
+                except Exception:
+                    pass
+    browser_proxy = build_browser_proxy_config(proxy)
+    if browser_proxy:
+        options.set_proxy(browser_proxy)
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
     return options
@@ -762,6 +1351,352 @@ def yyds_get_oai_code(
     raise Exception(f"YYDS 在 {timeout}s 内未收到验证码邮件")
 
 
+# ===== FreeMail 邮箱 =====
+
+FREEMAIL_DOMAIN_MAX_WEIGHT = 100
+_freemail_domain_lock = threading.Lock()
+_freemail_domain_mismatch_warned = False
+
+
+def get_freemail_api_base():
+    return str(config.get("freemail_api_base", "") or "").rstrip("/")
+
+
+def get_freemail_admin_token():
+    return str(config.get("freemail_admin_token", "") or "").strip()
+
+
+def _split_domain_string(value):
+    if value is None:
+        return []
+    return [
+        part.strip().lower()
+        for part in str(value).replace("，", ",").split(",")
+        if part.strip()
+    ]
+
+
+def normalize_freemail_domains(raw_entries=None, legacy_value=""):
+    """统一 freemail_domains 为 [{"domain","weight"}] 列表。
+
+    支持结构化列表 [{"domain":"a.com","weight":3}]、纯字符串列表 ["a.com"]、
+    逗号分隔字符串 "a.com,b.com"。weight 钳到 [1, 100]。域名小写去重保持顺序。
+    """
+    weights = {}
+    order = []
+
+    def _safe_int(value, default, minimum=1):
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, n)
+
+    def add_domain(domain, weight=1):
+        normalized_domain = str(domain or "").strip().lower()
+        if not normalized_domain:
+            return
+        normalized_weight = min(_safe_int(weight, 1, minimum=1), FREEMAIL_DOMAIN_MAX_WEIGHT)
+        if normalized_domain not in weights:
+            order.append(normalized_domain)
+            weights[normalized_domain] = 0
+        weights[normalized_domain] = min(weights[normalized_domain] + normalized_weight, FREEMAIL_DOMAIN_MAX_WEIGHT)
+
+    if raw_entries is not None:
+        if isinstance(raw_entries, list):
+            for item in raw_entries:
+                if isinstance(item, dict):
+                    add_domain(item.get("domain"), item.get("weight", 1))
+                else:
+                    add_domain(item, 1)
+        elif isinstance(raw_entries, str):
+            for domain in _split_domain_string(raw_entries):
+                add_domain(domain, 1)
+        else:
+            add_domain(raw_entries, 1)
+    else:
+        for domain in _split_domain_string(legacy_value):
+            add_domain(domain, 1)
+
+    return [{"domain": domain, "weight": weights[domain]} for domain in order]
+
+
+def get_freemail_domain_configs():
+    return normalize_freemail_domains(
+        config.get("freemail_domains") or None,
+        config.get("freemail_domain", ""),
+    )
+
+
+def freemail_admin_headers():
+    token = get_freemail_admin_token()
+    if not token:
+        return {}
+    return {
+        "Authorization": f"Bearer {token}",
+        "X-Admin-Token": token,
+    }
+
+
+def freemail_fetch_domains(api_base):
+    """GET /domains -> 可用域名列表（字符串数组）。失败返回 []。"""
+    try:
+        resp = http_get(f"{api_base}/domains", headers=freemail_admin_headers())
+        if resp.status_code == 200:
+            data = resp.json() if resp.text else []
+            if isinstance(data, list):
+                return [str(item).strip() for item in data if str(item).strip()]
+            if isinstance(data, dict):
+                members = (
+                    data.get("domains")
+                    or data.get("data")
+                    or data.get("hydra:member")
+                    or data.get("results")
+                )
+                if isinstance(members, list):
+                    return [str(item).strip() for item in members if str(item).strip()]
+    except Exception:
+        pass
+    return []
+
+
+def _select_freemail_domain_index(available_domains):
+    """根据配置权重在服务端可用域名中加权随机选一个 index。
+
+    available_domains 为 GET /domains 返回的字符串列表。
+    返回 int 索引或 None（无可用域名时）。
+    """
+    global _freemail_domain_mismatch_warned
+
+    live_indices = []
+    live_index_by_domain = {}
+    for index, domain in enumerate(available_domains or []):
+        normalized_domain = str(domain or "").strip().lower()
+        if not normalized_domain:
+            continue
+        live_indices.append(index)
+        live_index_by_domain.setdefault(normalized_domain, index)
+
+    if not live_indices:
+        return None
+
+    configs = get_freemail_domain_configs()
+    if configs:
+        population = []
+        weights = []
+        for item in configs:
+            domain_index = live_index_by_domain.get(item["domain"])
+            if domain_index is not None:
+                population.append(domain_index)
+                weights.append(max(1, item.get("weight", 1)))
+        if not population:
+            if not _freemail_domain_mismatch_warned:
+                configured = ", ".join(c["domain"] for c in configs)
+                available = ", ".join(str(available_domains[i]) for i in live_indices)
+                print(f"  ⚠️ FreeMail 配置域名不在 /domains 中，改用服务端域名等权随机: 配置={configured} | 可用={available}")
+                _freemail_domain_mismatch_warned = True
+            return random.choice(live_indices)
+        return random.choices(population, weights=weights, k=1)[0]
+    return random.choice(live_indices)
+
+
+def _build_freemail_token(address):
+    """把 address 自包装成 mail_token，下游 get_oai_code 再解析回 address。"""
+    return json.dumps({"type": "freemail", "address": address}, ensure_ascii=True)
+
+
+def _parse_freemail_token(mail_token):
+    if not mail_token:
+        return {}
+    if isinstance(mail_token, str):
+        token = mail_token.strip()
+        if "@" in token and not token.startswith("{"):
+            return {"type": "freemail", "address": token}
+        try:
+            data = json.loads(token)
+        except Exception:
+            return {}
+        if isinstance(data, dict) and data.get("address"):
+            return {"type": "freemail", "address": str(data["address"]).strip()}
+    return {}
+
+
+def freemail_create_address(api_base, max_retries=5, log_callback=None):
+    """POST /create 创建邮箱，返回完整地址；地址碰撞自动换名重试。"""
+    admin_token = get_freemail_admin_token()
+    if not api_base or not admin_token:
+        raise Exception("FreeMail api_base 或 admin_token 未配置")
+
+    available_domains = freemail_fetch_domains(api_base)
+    headers = freemail_admin_headers()
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        local_name = generate_username(10)
+        payload = {"local": local_name}
+        domain_index = _select_freemail_domain_index(available_domains)
+        if domain_index is not None:
+            payload["domainIndex"] = domain_index
+        try:
+            resp = http_post(f"{api_base}/create", json=payload, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json() if resp.text else {}
+                address = str((data or {}).get("email") or "").strip()
+                if address:
+                    if log_callback:
+                        log_callback(f"[*] 已创建 FreeMail 邮箱: {address}")
+                    return address
+                raise Exception(f"创建邮箱未返回 email: {resp.text[:200]}")
+            if resp.status_code in (400, 409) and ("已存在" in resp.text or "exists" in resp.text.lower()):
+                if log_callback:
+                    log_callback("[Debug] FreeMail 地址碰撞，换名重试")
+                continue
+            raise Exception(f"创建邮箱失败 HTTP {resp.status_code}: {resp.text[:200]}")
+        except Exception as exc:
+            last_exc = exc
+            if "已存在" in str(exc) or "exists" in str(exc).lower():
+                continue
+            raise Exception(f"FreeMail 创建邮箱失败: {exc}")
+    raise Exception(f"FreeMail 创建邮箱失败: 超过最大重试次数: {last_exc}")
+
+
+def freemail_get_messages(api_base, address):
+    """GET /emails?mailbox=<address>&limit=20 -> 邮件列表。"""
+    try:
+        resp = http_get(
+            f"{api_base}/emails",
+            params={"mailbox": address, "limit": 20},
+            headers=freemail_admin_headers(),
+        )
+        if resp.status_code == 200:
+            data = resp.json() if resp.text else []
+            return data if isinstance(data, list) else (data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), list) else [])
+    except Exception:
+        pass
+    return []
+
+
+def freemail_get_message_detail(api_base, msg_id):
+    """GET /email/<msg_id> -> 单封详情，归一化 text/html 字段。"""
+    try:
+        resp = http_get(f"{api_base}/email/{msg_id}", headers=freemail_admin_headers())
+        if resp.status_code == 200:
+            data = resp.json() if resp.text else {}
+            if isinstance(data, dict):
+                content = data.get("content") or ""
+                html_content = data.get("html_content") or ""
+                data["text"] = content if content else data.get("text", "")
+                data["html"] = html_content if html_content else data.get("html", "")
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def freemail_delete_address(api_base, address, log_callback=None):
+    """DELETE /mailboxes?address=<address> 清理失败注册产生的邮箱，失败静默。"""
+    if not address or not api_base or not get_freemail_admin_token():
+        return
+    try:
+        proxies = get_proxies() or None
+        resp = requests.delete(
+            f"{api_base}/mailboxes",
+            params={"address": address},
+            headers=freemail_admin_headers(),
+            proxies=proxies,
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            if log_callback:
+                log_callback(f"[Debug] 已删除 FreeMail 临时邮箱: {address}")
+        elif log_callback:
+            log_callback(f"[Debug] 删除 FreeMail 邮箱失败: HTTP {resp.status_code}")
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 删除 FreeMail 邮箱异常: {exc}")
+
+
+def freemail_get_email_and_token(log_callback=None):
+    api_base = get_freemail_api_base()
+    address = freemail_create_address(api_base, log_callback=log_callback)
+    return address, _build_freemail_token(address)
+
+
+def freemail_get_oai_code(
+    mail_token,
+    address,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+):
+    """轮询 FreeMail 邮件，提取 grok 验证码（XXX-XXX）。"""
+    api_base = get_freemail_api_base()
+    if not api_base:
+        raise Exception("FreeMail API Base 未配置")
+    token_info = _parse_freemail_token(mail_token)
+    target_address = str(token_info.get("address") or address or "").strip().lower()
+    if not target_address:
+        raise Exception("FreeMail mail_token 缺少 address")
+
+    deadline = time.time() + timeout
+    seen_ids = set()
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        try:
+            messages = freemail_get_messages(api_base, target_address)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] FreeMail 拉取邮件列表失败: {exc}")
+            sleep_with_cancel(poll_interval, cancel_callback)
+            continue
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            msg_id = msg.get("id") or msg.get("message_id") or msg.get("@id")
+            if not msg_id:
+                continue
+            msg_key = str(msg_id)
+            if msg_key in seen_ids:
+                continue
+            seen_ids.add(msg_key)
+            # 优先从列表项直接解析，避免 detail 接口偶发不可达漏码
+            parts = []
+            for field in ("subject", "text", "raw", "content", "intro", "body", "snippet", "source", "bodyPreview"):
+                value = msg.get(field)
+                if isinstance(value, str) and value.strip():
+                    parts.append(value)
+            html_value = msg.get("html")
+            if isinstance(html_value, str) and html_value.strip():
+                parts.append(re.sub(r"<[^>]+>", " ", html_value))
+            subject = str(msg.get("subject", "") or "")
+            combined = "\n".join(parts)
+            # 再用 detail 接口补全
+            try:
+                detail = freemail_get_message_detail(api_base, msg_key)
+                if detail:
+                    for field in ("subject", "text", "raw", "content", "intro", "body", "snippet", "source"):
+                        value = detail.get(field)
+                        if isinstance(value, str) and value.strip():
+                            combined += "\n" + value
+                    html_detail = detail.get("html")
+                    if isinstance(html_detail, str) and html_detail.strip():
+                        combined += "\n" + re.sub(r"<[^>]+>", " ", html_detail)
+                    if not subject:
+                        subject = str(detail.get("subject", "") or "")
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] FreeMail detail 接口失败，改用列表内容解析: {exc}")
+            if log_callback and subject:
+                log_callback(f"[Debug] FreeMail 收到邮件: {subject}")
+            code = extract_verification_code(combined, subject)
+            if code:
+                if log_callback:
+                    log_callback(f"[*] FreeMail 从邮件中提取到验证码: {code}")
+                return code
+        sleep_with_cancel(poll_interval, cancel_callback)
+    raise Exception(f"FreeMail 在 {timeout}s 内未收到验证码邮件")
+
+
 def generate_username(length=10):
     chars = string.ascii_lowercase + string.digits
     return "".join(secrets.choice(chars) for _ in range(length))
@@ -787,6 +1722,8 @@ def get_email_provider():
 
 def get_email_and_token(api_key=None):
     provider = get_email_provider()
+    if provider == "freemail":
+        return freemail_get_email_and_token()
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
     if provider == "cloudflare":
@@ -839,6 +1776,15 @@ def get_oai_code(
     resend_callback=None,
 ):
     provider = get_email_provider()
+    if provider == "freemail":
+        return freemail_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
     if provider == "yyds":
         return yyds_get_oai_code(
             dev_token,
@@ -1212,6 +2158,7 @@ SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
 browser = None
 page = None
+_current_browser_proxy = None
 
 
 def setup_light_theme(root):
@@ -1267,7 +2214,9 @@ def tk_entry(parent, textvariable=None, width=30, **kwargs):
     )
 
 
-def tk_button(parent, text="", command=None, state=tk.NORMAL, **kwargs):
+def tk_button(parent, text="", command=None, state=None, **kwargs):
+    if state is None:
+        state = tk.NORMAL
     return tk.Button(
         parent,
         text=text,
@@ -1315,14 +2264,15 @@ def tk_option_menu(parent, variable, values, width=12):
     return menu
 
 
-def start_browser(log_callback=None):
-    global browser, page
+def start_browser(log_callback=None, proxy=None):
+    global browser, page, _current_browser_proxy
     last_exc = None
     for attempt in range(1, 5):
         try:
-            browser = Chromium(create_browser_options())
+            browser = Chromium(create_browser_options(proxy=proxy))
             tabs = browser.get_tabs()
             page = tabs[-1] if tabs else browser.new_tab()
+            _current_browser_proxy = proxy
             if log_callback and getattr(browser, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
             if log_callback and attempt > 1:
@@ -1354,9 +2304,9 @@ def stop_browser():
     page = None
 
 
-def restart_browser(log_callback=None):
+def restart_browser(log_callback=None, proxy=None):
     stop_browser()
-    return start_browser(log_callback=log_callback)
+    return start_browser(log_callback=log_callback, proxy=proxy)
 
 
 def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
@@ -1371,7 +2321,7 @@ def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
 def refresh_active_page():
     global browser, page
     if browser is None:
-        restart_browser()
+        restart_browser(proxy=_current_browser_proxy)
     try:
         tabs = browser.get_tabs()
         if tabs:
@@ -1379,7 +2329,7 @@ def refresh_active_page():
         else:
             page = browser.new_tab()
     except Exception:
-        restart_browser()
+        restart_browser(proxy=_current_browser_proxy)
     return page
 
 
@@ -1455,7 +2405,7 @@ def open_signup_page(log_callback=None, cancel_callback=None):
     global browser, page
     raise_if_cancelled(cancel_callback)
     if browser is None:
-        start_browser()
+        start_browser(proxy=_current_browser_proxy)
         if log_callback:
             log_callback("[*] 浏览器已启动")
     try:
@@ -1469,7 +2419,7 @@ def open_signup_page(log_callback=None, cancel_callback=None):
         except Exception as e2:
             if log_callback:
                 log_callback(f"[Debug] 创建新标签页异常: {e2}")
-            restart_browser()
+            restart_browser(proxy=_current_browser_proxy)
             page = browser.new_tab(SIGNUP_URL)
     page.wait.doc_loaded()
     sleep_with_cancel(2, cancel_callback)
@@ -2429,7 +3379,7 @@ class GrokRegisterGUI:
                 pady=3,
             )
 
-        def add_field(widget, row, column, columnspan=1, sticky=tk.EW):
+        def add_field(widget, row, column, columnspan=1, sticky="ew"):
             widget.grid(
                 row=row,
                 column=column,
@@ -2441,7 +3391,7 @@ class GrokRegisterGUI:
 
         add_label(0, 0, "邮箱服务商:")
         self.email_provider_var = tk.StringVar(value=config.get("email_provider", "duckmail"))
-        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["duckmail", "yyds", "cloudflare"], width=12)
+        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["duckmail", "yyds", "cloudflare", "freemail"], width=12)
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
 
         add_label(0, 2, "注册数量:")
@@ -2508,37 +3458,71 @@ class GrokRegisterGUI:
         self.cloudflare_paths_entry = tk_entry(config_frame, textvariable=self.cloudflare_paths_var, width=34)
         add_field(self.cloudflare_paths_entry, 4, 3)
 
-        add_label(5, 0, "grok2api 本地入池:")
+        add_label(5, 0, "FreeMail API Base:")
+        self.freemail_api_base_var = tk.StringVar(value=str(config.get("freemail_api_base", "")))
+        self.freemail_api_base_entry = tk_entry(config_frame, textvariable=self.freemail_api_base_var, width=72)
+        add_field(self.freemail_api_base_entry, 5, 1, columnspan=3)
+
+        add_label(6, 0, "FreeMail Admin Token:")
+        self.freemail_admin_token_var = tk.StringVar(value=str(config.get("freemail_admin_token", "")))
+        self.freemail_admin_token_entry = tk_entry(config_frame, textvariable=self.freemail_admin_token_var, width=34)
+        add_field(self.freemail_admin_token_entry, 6, 1)
+
+        add_label(6, 2, "FreeMail 域名(权重):")
+        _freemail_domains_display = config.get("freemail_domains") or config.get("freemail_domain", "")
+        if isinstance(_freemail_domains_display, list):
+            _freemail_domains_display = ",".join(
+                f"{d.get('domain')}" if isinstance(d, dict) else str(d)
+                for d in _freemail_domains_display
+            )
+        self.freemail_domains_var = tk.StringVar(value=str(_freemail_domains_display or ""))
+        self.freemail_domains_entry = tk_entry(config_frame, textvariable=self.freemail_domains_var, width=34)
+        add_field(self.freemail_domains_entry, 6, 3)
+
+        add_label(7, 0, "代理模式:")
+        self.proxy_mode_var = tk.StringVar(value=str(config.get("proxy_mode", "fixed")))
+        self.proxy_mode_combo = tk_option_menu(config_frame, self.proxy_mode_var, ["fixed", "pool"], width=12)
+        add_field(self.proxy_mode_combo, 7, 1, sticky=tk.W)
+
+        add_label(7, 2, "代理池:")
+        _proxy_pool_display = config.get("proxy_pool", [])
+        if isinstance(_proxy_pool_display, list):
+            _proxy_pool_display = "\n".join(str(p) for p in _proxy_pool_display)
+        self.proxy_pool_var = tk.StringVar(value=str(_proxy_pool_display or ""))
+        self.proxy_pool_entry = tk_entry(config_frame, textvariable=self.proxy_pool_var, width=34)
+        add_field(self.proxy_pool_entry, 7, 3)
+
+        add_label(8, 0, "grok2api 本地入池:")
         self.grok2api_local_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_local", True)))
         self.grok2api_local_auto_check = tk_checkbutton(config_frame, variable=self.grok2api_local_auto_var)
-        add_field(self.grok2api_local_auto_check, 5, 1, sticky=tk.W)
+        add_field(self.grok2api_local_auto_check, 8, 1, sticky=tk.W)
 
-        add_label(5, 2, "grok2api 池名:")
+        add_label(8, 2, "grok2api 池名:")
         self.grok2api_pool_name_var = tk.StringVar(value=str(config.get("grok2api_pool_name", "ssoBasic")))
         self.grok2api_pool_name_combo = tk_option_menu(
             config_frame, self.grok2api_pool_name_var, ["ssoBasic", "ssoSuper"], width=12
         )
-        add_field(self.grok2api_pool_name_combo, 5, 3, sticky=tk.W)
+        add_field(self.grok2api_pool_name_combo, 8, 3, sticky=tk.W)
 
-        add_label(6, 0, "本地 token.json:")
+        add_label(9, 0, "本地 token.json:")
         self.grok2api_local_file_var = tk.StringVar(value=str(config.get("grok2api_local_token_file", "")))
         self.grok2api_local_file_entry = tk_entry(config_frame, textvariable=self.grok2api_local_file_var, width=72)
-        add_field(self.grok2api_local_file_entry, 6, 1, columnspan=3)
+        add_field(self.grok2api_local_file_entry, 9, 1, columnspan=3)
 
-        add_label(7, 0, "grok2api 远端入池:")
+        add_label(10, 0, "grok2api 远端入池:")
         self.grok2api_remote_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_remote", False)))
         self.grok2api_remote_auto_check = tk_checkbutton(config_frame, variable=self.grok2api_remote_auto_var)
-        add_field(self.grok2api_remote_auto_check, 7, 1, sticky=tk.W)
+        add_field(self.grok2api_remote_auto_check, 10, 1, sticky=tk.W)
 
-        add_label(8, 0, "grok2api 远端 Base:")
+        add_label(11, 0, "grok2api 远端 Base:")
         self.grok2api_remote_base_var = tk.StringVar(value=str(config.get("grok2api_remote_base", "")))
         self.grok2api_remote_base_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_base_var, width=72)
-        add_field(self.grok2api_remote_base_entry, 8, 1, columnspan=3)
+        add_field(self.grok2api_remote_base_entry, 11, 1, columnspan=3)
 
-        add_label(9, 0, "grok2api 远端 app_key:")
+        add_label(12, 0, "grok2api 远端 app_key:")
         self.grok2api_remote_key_var = tk.StringVar(value=str(config.get("grok2api_remote_app_key", "")))
         self.grok2api_remote_key_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_key_var, width=72)
-        add_field(self.grok2api_remote_key_entry, 9, 1, columnspan=3)
+        add_field(self.grok2api_remote_key_entry, 12, 1, columnspan=3)
 
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
@@ -2623,6 +3607,23 @@ class GrokRegisterGUI:
         config["cloudflare_api_base"] = self.cloudflare_api_base_var.get().strip()
         config["cloudflare_api_key"] = self.cloudflare_api_key_var.get().strip()
         config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "bearer"
+        config["freemail_api_base"] = self.freemail_api_base_var.get().strip()
+        config["freemail_admin_token"] = self.freemail_admin_token_var.get().strip()
+        # 优先按 JSON 解析（结构化带权重），失败则按逗号分隔字符串
+        _fm_domains_raw = self.freemail_domains_var.get().strip()
+        if _fm_domains_raw.startswith("[") or _fm_domains_raw.startswith("{"):
+            try:
+                config["freemail_domains"] = json.loads(_fm_domains_raw)
+                config["freemail_domain"] = ""
+            except Exception:
+                config["freemail_domains"] = []
+                config["freemail_domain"] = _fm_domains_raw
+        else:
+            config["freemail_domains"] = []
+            config["freemail_domain"] = _fm_domains_raw
+        config["proxy_mode"] = self.proxy_mode_var.get().strip() or "fixed"
+        _pp_raw = [p.strip() for p in self.proxy_pool_var.get().replace("\n", ",").split(",") if p.strip()]
+        config["proxy_pool"] = _pp_raw
         config["grok2api_auto_add_local"] = bool(self.grok2api_local_auto_var.get())
         config["grok2api_local_token_file"] = self.grok2api_local_file_var.get().strip()
         config["grok2api_pool_name"] = self.grok2api_pool_name_var.get().strip() or "ssoBasic"
@@ -2670,7 +3671,11 @@ class GrokRegisterGUI:
 
     def run_registration(self, count):
         try:
-            start_browser(log_callback=self.log)
+            pool_allocator = _init_proxy_pool(log_callback=self.log)
+            first_proxy = pool_allocator.acquire()["value"] if pool_allocator else None
+            if pool_allocator:
+                self.log(f"[*] 代理池模式: 本轮首个出口 {mask_proxy(first_proxy)}")
+            start_browser(log_callback=self.log, proxy=first_proxy)
             self.log("[*] 浏览器已启动")
             i = 0
             retry_count_for_slot = 0
@@ -2791,10 +3796,11 @@ class GrokRegisterGUI:
                     self.update_stats()
                     if self.should_stop():
                         break
+                    next_proxy = pool_allocator.acquire()["value"] if pool_allocator else None
                     if browser is None:
-                        start_browser(log_callback=self.log)
+                        start_browser(log_callback=self.log, proxy=next_proxy)
                     else:
-                        restart_browser(log_callback=self.log)
+                        restart_browser(log_callback=self.log, proxy=next_proxy)
                     sleep_with_cancel(1, self.should_stop)
         except Exception as exc:
             self.log(f"[!] 任务异常: {exc}")
@@ -2833,7 +3839,15 @@ def run_registration_cli(count):
     cli_log(f"[*] 终端模式启动，目标数量: {count}")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
     try:
-        start_browser(log_callback=cli_log)
+        try:
+            pool_allocator = _init_proxy_pool(log_callback=cli_log)
+        except RuntimeError as exc:
+            cli_log(f"[!] {exc}")
+            return
+        first_proxy = pool_allocator.acquire()["value"] if pool_allocator else None
+        if pool_allocator:
+            cli_log(f"[*] 代理池模式: 本轮首个出口 {mask_proxy(first_proxy)}")
+        start_browser(log_callback=cli_log, proxy=first_proxy)
         cli_log("[*] 浏览器已启动")
         i = 0
         while i < count:
@@ -2945,10 +3959,11 @@ def run_registration_cli(count):
             finally:
                 if controller.should_stop():
                     break
+                next_proxy = pool_allocator.acquire()["value"] if pool_allocator else None
                 if browser is None:
-                    start_browser(log_callback=cli_log)
+                    start_browser(log_callback=cli_log, proxy=next_proxy)
                 else:
-                    restart_browser(log_callback=cli_log)
+                    restart_browser(log_callback=cli_log, proxy=next_proxy)
                 sleep_with_cancel(1, controller.should_stop)
     except KeyboardInterrupt:
         controller.stop()
@@ -2981,6 +3996,9 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1].strip().lower() in ("start", "cli", "--cli"):
         main_cli()
         return
+    if tk is None:
+        print("[!] 当前环境缺少 tkinter，无法启动 GUI。请安装 tkinter 或使用 CLI 模式：python grok_register_ttk.py cli")
+        sys.exit(1)
     root = tk.Tk()
     setup_light_theme(root)
     app = GrokRegisterGUI(root)

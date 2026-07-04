@@ -39,7 +39,9 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - 支持 GUI 图形界面运行。
 - 支持 CLI 终端运行，不启动 Tk GUI。
 - 注册流程使用 Chromium/Chrome 浏览器页面完成。
-- 支持 DuckMail、YYDS、Cloudflare 临时邮箱接口。
+- 支持 DuckMail、YYDS、Cloudflare、FreeMail 临时邮箱接口。
+- 支持 FreeMail 多域名加权轮询配置。
+- 支持 HTTP/SOCKS5 代理池，每账号轮换出口 IP 降低风控；带认证的 SOCKS5 自动经本地认证桥接入浏览器。
 - 支持验证码邮件轮询和解析。
 - 支持成功账号实时写入 `accounts_*.txt`。
 - 支持将 SSO token 写入 grok2api 本地或远端池。
@@ -81,9 +83,13 @@ cp config.example.json config.json
 
 | 配置项 | 说明 |
 | --- | --- |
-| `email_provider` | 邮箱服务商：`duckmail`、`yyds`、`cloudflare` |
+| `email_provider` | 邮箱服务商：`duckmail`、`yyds`、`cloudflare`、`freemail` |
 | `register_count` | 本次目标注册数量 |
-| `proxy` | 代理地址，可留空 |
+| `proxy` | 固定代理地址（`proxy_mode=fixed` 时使用），可留空 |
+| `proxy_mode` | 代理模式：`fixed`（沿用单个 `proxy`）或 `pool`（启用代理池，仅作用于浏览器注册阶段） |
+| `proxy_pool` | 代理池列表，支持 `http://`、`https://`、`socks5://`；带认证的 socks5 写 `socks5://user:pass@host:port` |
+| `register_proxy_cooldown_seconds` | 代理池中同一节点两次使用间的冷却秒数（默认 180） |
+| `register_proxy_pool_random_start` | 代理池是否随机起始偏移（默认 true） |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 地址 |
 | `cloudflare_auth_mode` | Cloudflare API 鉴权模式：`none`、`bearer`、`x-api-key`、`query-key` |
@@ -93,6 +99,9 @@ cp config.example.json config.json
 | `grok2api_auto_add_remote` | 是否写入远端 grok2api |
 | `grok2api_remote_base` | 远端 grok2api 管理 API 地址 |
 | `grok2api_remote_app_key` | 远端 grok2api app key |
+| `freemail_api_base` | FreeMail 邮箱 API 地址 |
+| `freemail_admin_token` | FreeMail 管理员 Token |
+| `freemail_domains` | FreeMail 加权域名配置，结构化 `[{"domain":"a.com","weight":3},{"domain":"b.com","weight":1}]`；兼容逗号分隔字符串 |
 
 `config.json` 包含个人配置和密钥，不要提交到 Git。
 
@@ -119,6 +128,35 @@ Ctrl+C
 ```
 
 CLI 模式适合长时间批量运行。程序每成功注册 5 个账号会关闭浏览器、清理运行时对象并重新启动浏览器，降低长任务内存占用。
+
+### Linux 服务器运行（无显示器）
+
+grok 注册流程含 Cloudflare Turnstile 人机验证，**headless 模式通过率极低**，因此在 Linux 服务器上推荐用 **Xvfb 虚拟显卡**跑非 headless 浏览器。
+
+一键安装 Chromium + Xvfb（自动识别发行版）：
+
+```bash
+bash install_chromium.sh
+```
+
+用 Xvfb 虚拟显卡启动 CLI（脚本会在无显示器的环境自动包 `xvfb-run`）：
+
+```bash
+bash run_cli.sh
+```
+
+或手动：
+
+```bash
+xvfb-run -a -s '-screen 0 1280x800x24' python grok_register_ttk.py cli
+```
+
+可选配置（`config.json`）：
+
+| 配置项 | 说明 |
+| --- | --- |
+| `browser_path` | 浏览器可执行文件路径，留空时在 Linux 上自动探测 chromium/google-chrome |
+| `headless` | 是否无头模式；默认非 headless（Turnstile 需真实 DOM，Linux 用 Xvfb）；`true` 强制无头 |
 
 ### GUI 模式
 
