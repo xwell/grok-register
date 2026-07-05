@@ -196,6 +196,60 @@ crontab -e
 - 退出码非 0 时 cron 默认会发邮件；如需禁用可在行尾加 `|| true`，或重定向 `MAILTO=""`。
 - `config.json` 用脚本绝对路径定位（与 `run_cli.sh` 同目录），不受 cron 默认 CWD 影响。
 
+### 定时任务（systemd timer）
+
+仓库附带 `grok-timer.sh`，用 systemd timer 管理定时注册任务。你只需写熟悉的 **5 字段 cron 表达式**，脚本自动转 systemd `OnCalendar` 并安装系统级 `grok-register@<实例>.{service,timer}`。相比 crontab：日志进 journal、`Persistent=true` 关机错过会在开机补跑、`systemctl` 统一管理、支持多实例独立配置。
+
+```bash
+# 安装：每 6 小时注册 5 个账号（默认实例 default）
+sudo bash grok-timer.sh install -n 5 -c "0 */6 * * *"
+
+# 工作日早 9:30 注册 1 个，实例名 morning
+sudo bash grok-timer.sh install -n 1 -c "30 9 * * 1-5" -i morning
+
+# 查看状态 / 列出所有实例 / 立即触发一次 / 跟随日志
+sudo bash grok-timer.sh status -i morning
+sudo bash grok-timer.sh list
+sudo bash grok-timer.sh run-now -i morning
+sudo bash grok-timer.sh logs -i morning
+
+# 卸载（删 timer + 实例配置；最后一个实例卸载时连 service 模板一起移除）
+sudo bash grok-timer.sh uninstall -i morning
+```
+
+子命令：
+
+| 子命令 | 说明 |
+| --- | --- |
+| `install` | 安装/更新任务（必填 `-n`、`-c`；已存在同实例则更新调度/数量，幂等） |
+| `uninstall` | 卸载实例；无残留时移除 service 模板 |
+| `enable` / `disable` | 开机自启开关（不立即运行 / 不打断当前运行） |
+| `start` / `stop` | 启用 / 停用调度 |
+| `status` | 查看 timer、下次触发、service 最近一次结果 |
+| `list` | 列出所有已安装的 grok-register timer |
+| `run-now` | 立即触发一次 service（不等调度） |
+| `logs` | `journalctl -f` 跟随该实例日志 |
+| `convert` | 仅把 cron 转 `OnCalendar` 并打印（调试用，不需 root） |
+
+参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `-n` / `--count N` | 本次注册目标数量（install 必填，正整数） |
+| `-c` / `--cron "EXPR"` | 5 字段 cron 表达式（install 必填，如 `"0 */6 * * *"`） |
+| `-i` / `--instance NAME` | 实例名，默认 `default`；不同实例独立 count/调度 |
+| `--force` | install 时覆盖已存在的 service 模板 |
+
+cron 表达式支持 `*` / `*/N` / `N` / `a,b` / `a-b` / `a-b/N`；周字段 `0/7=Sun..6=Sat`；日与周同时指定时按 cron OR 语义拆为多条 `OnCalendar`。不支持 `L`/`W`/`#` 与 `@` 宏（systemd 限制）。
+
+说明：
+
+- 单元装在 `/etc/systemd/system`，需 root；`install`/`uninstall`/`enable`/`disable`/`start`/`stop` 需 root，`list`/`status`/`logs`/`convert` 只读不需 root。
+- service 为 `Type=oneshot`，`ExecStart` 调 `run_cli.sh -n ${REGISTER_COUNT} -y`，复用 CLI 非交互路径与退出码（`SuccessExitStatus=0 1 2`，失败不触发重启，由 timer 下次触发）。
+- `run_cli.sh` 未显式指定 `PYTHON` 时自动用仓库内 `venv/bin/python`（systemd 最小环境无用户 PATH，自动检测 venv 保证依赖可用）。
+- `Persistent=true`（错过补跑）、`RandomizedDelaySec=300`（随机抖动 0–5 分钟避免整点尖峰）。
+- 日志：`journalctl -u grok-register@<实例>`。
+
 可选配置（`config.json`）：
 
 | 配置项 | 说明 |
@@ -247,8 +301,11 @@ GUI 数量控件可能有上限。CLI 模式直接读取 `config.json` 中的 `r
 
 ```text
 .
-├── grok_register_ttk.py   # 主程序
+├── grok_register_ttk.py   # 主程序（GUI + CLI）
 ├── cf_mail_debug.py       # Cloudflare 邮箱调试工具
+├── run_cli.sh             # CLI 启动器（自动 Xvfb / venv，cron 友好）
+├── install_chromium.sh    # 安装 Chromium + Xvfb
+├── grok-timer.sh          # systemd timer 定时任务管理（cron→OnCalendar）
 ├── config.example.json    # 配置示例
 ├── requirements.txt       # Python 依赖
 └── README.md

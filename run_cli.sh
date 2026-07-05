@@ -14,9 +14,17 @@ cd "$(dirname "$0")"
 # cron 无 tty，确保非 cli_log 的库输出也及时落盘
 export PYTHONUNBUFFERED=1
 
-PY="${PYTHON:-python3}"
-if ! command -v "$PY" >/dev/null 2>&1; then
-    PY=python
+PY="${PYTHON:-}"
+# 若未显式指定 PYTHON，优先用仓库内 venv（systemd/cron 最小环境常无依赖）
+if [ -z "$PY" ]; then
+    if [ -x "$(dirname "$0")/venv/bin/python" ]; then
+        PY="$(dirname "$0")/venv/bin/python"
+    else
+        PY=python3
+        if ! command -v "$PY" >/dev/null 2>&1; then
+            PY=python
+        fi
+    fi
 fi
 
 # 检查 Xvfb 可用性；缺失则提示装
