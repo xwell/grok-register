@@ -28,6 +28,7 @@ import string
 import json
 import atexit
 import select
+import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
@@ -45,6 +46,9 @@ from faker import Faker
 
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+ACCOUNTS_DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts.db")
+ACCOUNTS_DB_LOCK = threading.Lock()
+ACCOUNTS_DB_INIT_DONE = False
 MEMORY_CLEANUP_INTERVAL = 5
 
 _faker_cache = None
@@ -138,6 +142,94 @@ def save_config():
             json.dump(config, f, indent=4, ensure_ascii=False)
     except Exception as e:
         print(f"保存配置失败: {e}")
+
+
+def _init_accounts_db(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS accounts (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            email       TEXT,
+            password    TEXT,
+            sso_token   TEXT,
+            given_name  TEXT,
+            family_name TEXT,
+            email_provider TEXT,
+            created_at  TEXT,
+            UNIQUE(email)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email)")
+    conn.commit()
+
+
+def _connect_accounts_db():
+    conn = sqlite3.connect(ACCOUNTS_DB_FILE, timeout=15, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def ensure_accounts_db():
+    global ACCOUNTS_DB_INIT_DONE
+    if ACCOUNTS_DB_INIT_DONE:
+        return
+    with ACCOUNTS_DB_LOCK:
+        if ACCOUNTS_DB_INIT_DONE:
+            return
+        os.makedirs(os.path.dirname(ACCOUNTS_DB_FILE), exist_ok=True)
+        conn = _connect_accounts_db()
+        try:
+            _init_accounts_db(conn)
+        finally:
+            conn.close()
+        ACCOUNTS_DB_INIT_DONE = True
+
+
+def save_account_to_db(
+    email,
+    password,
+    sso_token,
+    given_name="",
+    family_name="",
+    email_provider="",
+    created_at=None,
+    log_callback=None,
+):
+    """将成功账号写入本地 SQLite3 数据库（accounts.db）。
+
+    以 email 为唯一键，重复注册的同名邮箱会被忽略（INSERT OR IGNORE）。
+    所有写操作串行化以保证并发注册下的一致性。
+    """
+    ensure_accounts_db()
+    if created_at is None:
+        created_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with ACCOUNTS_DB_LOCK:
+        conn = _connect_accounts_db()
+        try:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO accounts
+                (email, password, sso_token, given_name, family_name, email_provider, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    email,
+                    password or "",
+                    sso_token or "",
+                    given_name or "",
+                    family_name or "",
+                    email_provider or "",
+                    created_at,
+                ),
+            )
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] 保存账号到数据库失败: {exc}")
+            return False
+        finally:
+            conn.close()
+    return True
 
 
 def ensure_stable_python_runtime():
@@ -3345,7 +3437,6 @@ class GrokRegisterGUI:
         self.results = []
         self.stop_requested = False
         self.ui_queue = queue.Queue()
-        self.accounts_output_file = ""
         self.setup_ui()
 
     def setup_ui(self):
@@ -3650,14 +3741,11 @@ class GrokRegisterGUI:
         self.success_count = 0
         self.fail_count = 0
         self.results = []
-        now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.accounts_output_file = os.path.join(
-            os.path.dirname(__file__), f"accounts_{now}.txt"
-        )
         self.update_stats()
         self._set_running_ui(True)
         self.log(f"[*] 配置已保存，开始执行。目标数量: {count}")
-        self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
+        ensure_accounts_db()
+        self.log(f"[*] 成功账号将实时保存到 SQLite 数据库: {ACCOUNTS_DB_FILE}")
         threading.Thread(
             target=self.run_registration,
             args=(count,),
@@ -3750,12 +3838,16 @@ class GrokRegisterGUI:
                         else:
                             self.log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
                     self.results.append({"email": email, "sso": sso, "profile": profile})
-                    try:
-                        line = f"{email}----{profile.get('password','')}----{sso}\n"
-                        with open(self.accounts_output_file, "a", encoding="utf-8") as f:
-                            f.write(line)
-                    except Exception as file_exc:
-                        self.log(f"[Debug] 保存账号文件失败: {file_exc}")
+                    provider = get_email_provider()
+                    save_account_to_db(
+                        email=email,
+                        password=profile.get("password", ""),
+                        sso_token=sso,
+                        given_name=profile.get("given_name", ""),
+                        family_name=profile.get("family_name", ""),
+                        email_provider=provider,
+                        log_callback=self.log,
+                    )
                     add_token_to_grok2api_pools(sso, email=email, log_callback=self.log)
                     self.success_count += 1
                     retry_count_for_slot = 0
@@ -3831,12 +3923,9 @@ def run_registration_cli(count):
     fail_count = 0
     retry_count_for_slot = 0
     max_slot_retry = 3
-    accounts_output_file = os.path.join(
-        os.path.dirname(__file__),
-        f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-    )
     cli_log(f"[*] 终端模式启动，目标数量: {count}")
-    cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
+    ensure_accounts_db()
+    cli_log(f"[*] 成功账号将实时保存到 SQLite 数据库: {ACCOUNTS_DB_FILE}")
     try:
         try:
             pool_allocator = _init_proxy_pool(log_callback=cli_log)
@@ -3919,12 +4008,16 @@ def run_registration_cli(count):
                         cli_log(f"[+] NSFW 开启成功: {nsfw_msg}")
                     else:
                         cli_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
-                try:
-                    line = f"{email}----{profile.get('password','')}----{sso}\n"
-                    with open(accounts_output_file, "a", encoding="utf-8") as f:
-                        f.write(line)
-                except Exception as file_exc:
-                    cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
+                provider = get_email_provider()
+                save_account_to_db(
+                    email=email,
+                    password=profile.get("password", ""),
+                    sso_token=sso,
+                    given_name=profile.get("given_name", ""),
+                    family_name=profile.get("family_name", ""),
+                    email_provider=provider,
+                    log_callback=cli_log,
+                )
                 add_token_to_grok2api_pools(sso, email=email, log_callback=cli_log)
                 success_count += 1
                 retry_count_for_slot = 0

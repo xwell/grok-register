@@ -8,6 +8,8 @@ venv/
 env/
 
 accounts_*.txt
+accounts.db
+accounts.db-*
 mail_credentials.txt
 *.txt
 !requirements.txt

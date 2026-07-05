@@ -43,7 +43,7 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - 支持 FreeMail 多域名加权轮询配置。
 - 支持 HTTP/SOCKS5 代理池，每账号轮换出口 IP 降低风控；带认证的 SOCKS5 自动经本地认证桥接入浏览器。
 - 支持验证码邮件轮询和解析。
-- 支持成功账号实时写入 `accounts_*.txt`。
+- 支持成功账号实时写入本地 SQLite3 数据库 `accounts.db`。
 - 支持将 SSO token 写入 grok2api 本地或远端池。
 - 支持注册后尝试开启 NSFW。
 - 支持页面卡住检测、当前账号重试、浏览器重启和内存清理。
@@ -170,7 +170,7 @@ GUI 模式会打开 Tkinter 窗口，适合手动调整配置和观察日志。
 
 运行过程中会生成：
 
-- `accounts_*.txt`：成功账号、密码和 SSO token。
+- `accounts.db`：SQLite3 数据库，存成功账号、密码、SSO token、姓名、邮箱提供商、注册时间（`accounts` 表，`email` 唯一）。
 - `mail_credentials.txt`：临时邮箱凭证。
 - `*.log`：可选日志文件。
 
