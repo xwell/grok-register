@@ -6,6 +6,7 @@ curl_cffi==0.13.0
 DataRecorder==3.6.2
 DownloadKit==2.0.7
 DrissionPage==4.1.1.4
+faker>=30.0.0
 filelock==3.19.1
 idna==3.13
 lxml==6.1.0

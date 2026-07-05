@@ -41,10 +41,25 @@ os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
+from faker import Faker
 
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 MEMORY_CLEANUP_INTERVAL = 5
+
+_faker_cache = None
+
+
+def _get_faker():
+    """获取 Faker 实例（延迟初始化，随机英文 locale 增强多样性）。
+
+    与 codex_heroSMS/src/core/config_loader.py 中 _get_faker 保持一致。
+    """
+    global _faker_cache
+    if _faker_cache is None:
+        locale = random.choice(["en_US", "en_US", "en_GB", "en_AU", "en_CA"])
+        _faker_cache = Faker(locale)
+    return _faker_cache
 
 UI_BG = "#242424"
 UI_PANEL_BG = "#2b2b2b"
@@ -1235,8 +1250,7 @@ def yyds_get_message_detail(message_id, token=None, api_key=None, jwt=None):
 
 
 def yyds_generate_username(length=10):
-    chars = string.ascii_lowercase + string.digits
-    return "".join(secrets.choice(chars) for _ in range(length))
+    return _gen_email_local_name()
 
 
 def yyds_pick_domain(api_key=None, jwt=None):
@@ -1675,9 +1689,33 @@ def freemail_get_oai_code(
     raise Exception(f"FreeMail 在 {timeout}s 内未收到验证码邮件")
 
 
+def _gen_email_local_name():
+    """基于 Faker 生成自然人风格的邮箱 local-part（无点，避免与 FreeMail
+    dotted alias normalize 冲突）。模式与 codex_heroSMS 一致：
+      - 首字母+last+数字  → jsmith42
+      - first+last+数字   → emmawilson88
+      - first_+last        → alex_morgan
+      - first+数字         → william1988
+    """
+    fake = _get_faker()
+    first = re.sub(r"[^a-z]", "", fake.first_name().lower())
+    last = re.sub(r"[^a-z]", "", fake.last_name().lower())
+    if not first or not last:
+        chars = string.ascii_lowercase + string.digits
+        return "".join(secrets.choice(chars) for _ in range(10))
+    num = str(random.randint(10, 99))
+    year = str(random.randint(1985, 2002))
+    patterns = [
+        f"{first[0]}{last}{num}",
+        f"{first}{last}{num}",
+        f"{first}_{last}",
+        f"{first}{year}",
+    ]
+    return random.choice(patterns)
+
+
 def generate_username(length=10):
-    chars = string.ascii_lowercase + string.digits
-    return "".join(secrets.choice(chars) for _ in range(length))
+    return _gen_email_local_name()
 
 
 def pick_domain(api_key=None):
@@ -2908,26 +2946,9 @@ if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
 
 
 def build_profile():
-    given_name_pool = [
-        "Neo", "Ethan", "Liam", "Noah", "Lucas", "Mason", "Ryan", "Leo",
-        "Owen", "Aiden", "Elio", "Aron", "Ivan", "Nolan", "Evan", "Kai",
-        "Caleb", "Adam", "Ezra", "Miles", "Logan", "Carter", "Hunter", "Jason",
-        "Brian", "Dylan", "Alex", "Colin", "Blake", "Gavin", "Henry", "Julian",
-        "Kevin", "Louis", "Marcus", "Nathan", "Oscar", "Peter", "Quinn", "Robin",
-        "Simon", "Tristan", "Victor", "Wesley", "Xavier", "Yuri", "Zane", "Felix",
-        "Aaron", "Damian",
-    ]
-    family_name_pool = [
-        "Lin", "Wang", "Zhao", "Liu", "Chen", "Zhang", "Xu", "Sun",
-        "Guo", "He", "Yang", "Wu", "Zhou", "Tang", "Qin", "Shi",
-        "Fang", "Peng", "Cao", "Deng", "Fan", "Fu", "Gao", "Han",
-        "Hu", "Jiang", "Kong", "Lu", "Ma", "Nie", "Pan", "Qiao",
-        "Ren", "Shao", "Tian", "Xie", "Yan", "Yao", "Yu", "Zeng",
-        "Bai", "Duan", "Hou", "Jin", "Kang", "Luo", "Mao", "Song",
-        "Wei", "Xiong",
-    ]
-    given_name = random.choice(given_name_pool)
-    family_name = random.choice(family_name_pool)
+    fake = _get_faker()
+    given_name = fake.first_name()
+    family_name = fake.last_name()
     password = "N" + secrets.token_hex(4) + "!a7#" + secrets.token_urlsafe(6)
     return given_name, family_name, password
 
