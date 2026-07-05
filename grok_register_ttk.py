@@ -29,6 +29,7 @@ import json
 import atexit
 import select
 import sqlite3
+import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
@@ -3931,7 +3932,7 @@ def run_registration_cli(count):
             pool_allocator = _init_proxy_pool(log_callback=cli_log)
         except RuntimeError as exc:
             cli_log(f"[!] {exc}")
-            return
+            return success_count, fail_count
         first_proxy = pool_allocator.acquire()["value"] if pool_allocator else None
         if pool_allocator:
             cli_log(f"[*] 代理池模式: 本轮首个出口 {mask_proxy(first_proxy)}")
@@ -4065,28 +4066,88 @@ def run_registration_cli(count):
     finally:
         cleanup_runtime_memory(log_callback=cli_log, reason="任务结束")
         cli_log(f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}")
+    return success_count, fail_count
 
 
-def main_cli():
+def main_cli(args=None):
     load_config()
-    count = int(config.get("register_count", 1) or 1)
+    if args is not None and args.count is not None:
+        count = args.count
+    else:
+        count = int(config.get("register_count", 1) or 1)
+    if count < 1:
+        cli_log("[!] 注册数量非法，须为正整数")
+        sys.exit(2)
+    # -n/-y 显式触发非交互；stdin 非 tty（如 cron）也自动非交互，避免 input() 阻塞或抛 EOFError
+    non_interactive = (
+        args is not None and (args.non_interactive or args.count is not None)
+    ) or not sys.stdin.isatty()
     cli_log("[*] CLI 已加载配置")
     cli_log(f"[*] 当前邮箱服务商: {config.get('email_provider', 'duckmail')} | 注册数量: {count}")
+    if non_interactive:
+        cli_log("[*] 非交互模式，直接开始（Ctrl+C 可强制停止）")
+        success_count, fail_count = run_registration_cli(count)
+        sys.exit(0 if success_count > 0 else 1)
     cli_log("[*] 输入 start 后开始；按 Ctrl+C 可强制停止")
     try:
         command = input("> ").strip().lower()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         cli_log("[!] 已取消")
-        return
+        sys.exit(0)
     if command != "start":
         cli_log("[!] 未输入 start，已退出")
-        return
-    run_registration_cli(count)
+        sys.exit(0)
+    success_count, fail_count = run_registration_cli(count)
+    sys.exit(0 if success_count > 0 else 1)
+
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser(
+        prog="grok_register_ttk.py",
+        description="Grok 注册机。不带参数启动 GUI；cli/start/--cli 或 -n/-y 进入 CLI 模式。",
+    )
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        default=None,
+        help="CLI 模式：cli 或 start（等价）。省略则进入 GUI（除非带了 -n/-y）。",
+    )
+    parser.add_argument(
+        "--cli",
+        dest="cli_flag",
+        action="store_true",
+        help="等价于位置参数 cli，进入 CLI 模式。",
+    )
+    parser.add_argument(
+        "-n",
+        "--count",
+        dest="count",
+        type=int,
+        default=None,
+        help="本次注册目标数量（覆盖 config.json 的 register_count，不写回）。隐含非交互模式。",
+    )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        "--non-interactive",
+        dest="non_interactive",
+        action="store_true",
+        help="非交互模式，跳过 start 确认，适合 crontab。stdin 非 tty 时自动启用。",
+    )
+    return parser
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1].strip().lower() in ("start", "cli", "--cli"):
-        main_cli()
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    enter_cli = (
+        args.mode in ("cli", "start")
+        or args.cli_flag
+        or args.count is not None
+        or args.non_interactive
+    )
+    if enter_cli:
+        main_cli(args)
         return
     if tk is None:
         print("[!] 当前环境缺少 tkinter，无法启动 GUI。请安装 tkinter 或使用 CLI 模式：python grok_register_ttk.py cli")

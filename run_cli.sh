@@ -3,9 +3,16 @@
 # - 桌面环境（有 $DISPLAY）：直接跑
 # - 无显示器服务器：用 xvfb-run 虚拟显卡跑非 headless（Turnstile 需要真实 DOM）
 # 用法：bash run_cli.sh [python 脚本的额外参数...]
+#   非交互 + 指定数量（适合 crontab）：bash run_cli.sh -n 5 -y
+#   crontab 示例：
+#     0 */6 * * * cd /path/to/grok-register && bash run_cli.sh -n 5 -y >> /var/log/grok-register.log 2>&1
+# 退出码：≥1 个注册成功 → 0；全部失败 → 非 0；参数非法 → 2。
 set -e
 
 cd "$(dirname "$0")"
+
+# cron 无 tty，确保非 cli_log 的库输出也及时落盘
+export PYTHONUNBUFFERED=1
 
 PY="${PYTHON:-python3}"
 if ! command -v "$PY" >/dev/null 2>&1; then

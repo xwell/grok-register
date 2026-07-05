@@ -129,6 +129,32 @@ Ctrl+C
 
 CLI 模式适合长时间批量运行。程序每成功注册 5 个账号会关闭浏览器、清理运行时对象并重新启动浏览器，降低长任务内存占用。
 
+#### 非交互模式（命令行传参）
+
+支持通过参数覆盖本次注册数量并跳过 `start` 确认，便于脚本/crontab 调度：
+
+```bash
+python grok_register_ttk.py cli -n 5 -y
+# 或经 run_cli.sh（自动处理 Xvfb）
+bash run_cli.sh -n 5 -y
+```
+
+参数说明：
+
+| 参数 | 说明 |
+| --- | --- |
+| `-n` / `--count N` | 本次目标注册数量，覆盖 `config.json` 的 `register_count`，**不写回配置**。隐含非交互模式。 |
+| `-y` / `--yes` / `--non-interactive` | 非交互模式，跳过 `start` 确认。stdin 非 tty（如 cron）时自动启用。 |
+| `cli` / `start` / `--cli` | 进入 CLI 模式（不带 `-n`/`-y` 且 stdin 是 tty 时仍需手动输入 `start`）。 |
+
+退出码（便于 cron/脚本检测失败）：
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 至少成功注册 1 个账号 |
+| `1` | 目标数量 > 0 但 0 成功（全失败/代理初始化失败/未开始即被取消） |
+| `2` | 参数非法（如 `-n 0`、`-n abc`） |
+
 ### Linux 服务器运行（无显示器）
 
 grok 注册流程含 Cloudflare Turnstile 人机验证，**headless 模式通过率极低**，因此在 Linux 服务器上推荐用 **Xvfb 虚拟显卡**跑非 headless 浏览器。
@@ -150,6 +176,25 @@ bash run_cli.sh
 ```bash
 xvfb-run -a -s '-screen 0 1280x800x24' python grok_register_ttk.py cli
 ```
+
+### 定时任务（crontab）
+
+CLI 模式支持非交互参数，可直接挂到 crontab 定时执行。cron 运行环境无 tty，`-y`（或自动检测）会跳过 `start` 确认，`-n` 指定每次注册数量。
+
+```bash
+# 每 6 小时注册 5 个账号，日志追加到文件
+crontab -e
+```
+
+```cron
+0 */6 * * * cd /path/to/grok-register && bash run_cli.sh -n 5 -y >> /var/log/grok-register.log 2>&1
+```
+
+说明：
+
+- cron 默认无 `DISPLAY`，`run_cli.sh` 会自动包 `xvfb-run` 跑非 headless 浏览器（Turnstile 需真实 DOM）。
+- 退出码非 0 时 cron 默认会发邮件；如需禁用可在行尾加 `|| true`，或重定向 `MAILTO=""`。
+- `config.json` 用脚本绝对路径定位（与 `run_cli.sh` 同目录），不受 cron 默认 CWD 影响。
 
 可选配置（`config.json`）：
 
