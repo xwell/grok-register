@@ -97,8 +97,8 @@ cp config.example.json config.json
 | `grok2api_auto_add_local` | 是否写入本地 grok2api token 池 |
 | `grok2api_local_token_file` | 本地 grok2api token 文件路径 |
 | `grok2api_auto_add_remote` | 是否写入远端 grok2api |
-| `grok2api_remote_base` | 远端 grok2api 管理 API 地址 |
-| `grok2api_remote_app_key` | 远端 grok2api app key |
+| `grok2api_remote_base` | 远端 grok2api 站点根地址（如 `http://127.0.0.1:8000`），程序会自动拼接 `/admin/api/tokens/add` |
+| `grok2api_remote_app_key` | 远端 grok2api 管理后台密码（`app.app_key`，默认 `grok2api`），以 `Bearer` 鉴权 |
 | `freemail_api_base` | FreeMail 邮箱 API 地址 |
 | `freemail_admin_token` | FreeMail 管理员 Token |
 | `freemail_domains` | FreeMail 加权域名配置，结构化 `[{"domain":"a.com","weight":3},{"domain":"b.com","weight":1}]`；兼容逗号分隔字符串 |

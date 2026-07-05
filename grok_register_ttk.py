@@ -827,6 +827,15 @@ def add_token_to_grok2api_local_pool(raw_token, email="", log_callback=None):
 
 
 def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
+    """将 SSO token 写入远端 grok2api（jiujiu532/grok2api）的指定池。
+
+    远端 API 形态（与 jiujiu532/grok2api 对齐）：
+      - 鉴权：Authorization: Bearer <app_key>（app.app_key，默认 grok2api；也接受 ?app_key=）
+      - POST /admin/api/tokens/add   -> 增量添加 {tokens:[...], pool, tags}
+      - GET  /admin/api/tokens        -> {"tokens": [flat 列表，每项含 pool 字段]}
+      - POST /admin/api/tokens        -> 整池替换（会清空其它 token，仅作兜底，慎用）
+    优先用 /tokens/add 增量接口（不覆盖、不误删其它 token）。
+    """
     token = _normalize_sso_token(raw_token)
     if not token:
         return False
@@ -837,57 +846,26 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
         if log_callback:
             log_callback("[Debug] grok2api 远端未配置 base/app_key，跳过")
         return False
-    headers = {"Content-Type": "application/json"}
-    query = {"app_key": app_key}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {app_key}",
+    }
+    # grok2api-jj 的池名为 basic/super；本地用 ssoBasic/ssoSuper 命名，做一次映射
     pool_map = {"ssoBasic": "basic", "ssoSuper": "super"}
-    remote_pool = pool_map.get(pool_name, "basic")
-    # 优先使用 add 接口，避免全量覆盖远端池
+    remote_pool = pool_map.get(pool_name, pool_name.lower())
+
+    add_api = f"{base}/admin/api/tokens/add"
+    add_payload = {"tokens": [token], "pool": remote_pool, "tags": ["auto-register"]}
     try:
-        add_payload = {"tokens": [token], "pool": remote_pool, "tags": ["auto-register"]}
-        resp_add = http_post(
-            f"{base}/tokens/add",
-            headers=headers,
-            params=query,
-            json=add_payload,
-            timeout=30,
-            proxies={},
-        )
+        resp_add = http_post(add_api, headers=headers, json=add_payload, timeout=30, proxies={})
         resp_add.raise_for_status()
         if log_callback:
-            log_callback(f"[+] 已写入 grok2api 远端池: {pool_name} ({base}/tokens/add)")
+            log_callback(f"[+] 已写入 grok2api 远端池: {pool_name} ({add_api})")
         return True
-    except Exception as add_exc:
+    except Exception as exc:
         if log_callback:
-            log_callback(f"[Debug] /tokens/add 写入失败，尝试 /tokens 全量模式: {add_exc}")
-
-    # 兜底：旧版全量保存接口
-    current = {}
-    try:
-        resp = http_get(f"{base}/tokens", headers=headers, params=query, timeout=20, proxies={})
-        if resp.status_code == 200:
-            payload = resp.json()
-            current = payload.get("tokens", {}) if isinstance(payload, dict) else {}
-    except Exception:
-        current = {}
-    if not isinstance(current, dict):
-        current = {}
-    pool = current.get(pool_name)
-    if not isinstance(pool, list):
-        pool = []
-    existing = set()
-    for item in pool:
-        if isinstance(item, str):
-            existing.add(_normalize_sso_token(item))
-        elif isinstance(item, dict):
-            existing.add(_normalize_sso_token(item.get("token", "")))
-    if token not in existing:
-        pool.append({"token": token, "tags": ["auto-register"], "note": email})
-    current[pool_name] = pool
-    resp2 = http_post(f"{base}/tokens", headers=headers, params=query, json=current, timeout=30, proxies={})
-    resp2.raise_for_status()
-    if log_callback:
-        log_callback(f"[+] 已写入 grok2api 远端池: {pool_name} ({base}/tokens)")
-    return True
+            log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
+        return False
 
 
 def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
