@@ -4,18 +4,24 @@ from pathlib import Path
 path = Path(__file__).resolve().with_name("apply_full_safe_modularization.py")
 text = path.read_text(encoding="utf-8")
 
-old_import = '''import_block = '''\\nimport functools\\nimport app_config as _app_config\\n'''
-new_import = '''import_block = '''\\nimport functools\\nimport types\\nimport app_config as _app_config\\n'''
-if old_import not in text:
-    raise RuntimeError("main import block anchor not found")
-text = text.replace(old_import, new_import, 1)
 
-old_getattr = '''def __getattr__(name):
+def replace_once(source, old, new, label):
+    count = source.count(old)
+    if count != 1:
+        raise RuntimeError(f"{label}: expected one match, got {count}")
+    return source.replace(old, new, 1)
+
+
+old_import = "import_block = '''\nimport functools\nimport app_config as _app_config\n"
+new_import = "import_block = '''\nimport functools\nimport types\nimport app_config as _app_config\n"
+text = replace_once(text, old_import, new_import, "main import block")
+
+old_getattr = """def __getattr__(name):
     if name in {{"browser", "page", "browser_proxy_bridge", "browser_started_with_proxy", "cf_clearance"}}:
         return getattr(_registration_browser, name)
     raise AttributeError(name)
-'''
-new_getattr = '''def __getattr__(name):
+"""
+new_getattr = """def __getattr__(name):
     if name in {{"browser", "page", "browser_proxy_bridge", "browser_started_with_proxy", "cf_clearance"}}:
         return getattr(_registration_browser, name)
     if name in {{"_cf_domain_index", "_cloudmail_domain_index"}}:
@@ -40,10 +46,8 @@ class _CompatibilityModule(types.ModuleType):
 
 
 sys.modules[__name__].__class__ = _CompatibilityModule
-'''
-if old_getattr not in text:
-    raise RuntimeError("compatibility getattr anchor not found")
-text = text.replace(old_getattr, new_getattr, 1)
+"""
+text = replace_once(text, old_getattr, new_getattr, "compatibility getattr block")
 
 path.write_text(text, encoding="utf-8")
 print("shared state compatibility patch applied")
