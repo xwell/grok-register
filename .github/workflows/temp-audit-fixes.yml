@@ -1,0 +1,30 @@
+name: Temporary audit fixes
+
+on:
+  workflow_dispatch:
+  issues:
+    types: [edited]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event_name == 'workflow_dispatch' || github.event.issue.number == 7
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply audit fixes
+        run: python tools/apply_audit_fixes.py
+      - name: Commit and cleanup
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -f tools/apply_audit_fixes.py .github/workflows/temp-audit-fixes.yml
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "fix: harden token pools and CPA export"
+            git push
+          fi
