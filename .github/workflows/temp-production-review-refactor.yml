@@ -1,0 +1,25 @@
+name: Temporary production review refactor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-production-refactor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/remaining-review-hardening
+      - name: Apply production code changes
+        run: python tools/apply_remaining_review_fixes.py
+      - name: Commit production changes and remove temporary tools
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -f tools/apply_remaining_review_fixes.py tools/review_fix_payloads.py
+          git add -A
+          git commit -m "fix: resolve remaining production review findings"
+          git push origin HEAD:fix/remaining-review-hardening
