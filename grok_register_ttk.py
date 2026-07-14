@@ -94,6 +94,10 @@ DEFAULT_CONFIG = {
     "cpa_oidc_request_timeout_sec": 15,
     "cpa_oidc_poll_timeout_sec": 15,
     "grok2api_allow_legacy_full_save": False,
+    "email_provider": "duckmail",
+    "yyds_api_key": "",
+    "yyds_jwt": "",
+    "defaultDomains": "",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -188,6 +192,34 @@ def validate_config(raw):
         if value not in allowed:
             raise ConfigError(f"配置项 {key} 的值无效: {value!r}; 允许值: {sorted(allowed)}")
         cfg[key] = value
+
+    api_path_keys = {
+        "cloudflare_path_domains", "cloudflare_path_accounts",
+        "cloudflare_path_token", "cloudflare_path_messages",
+        "cloudmail_path_messages",
+    }
+    for key in api_path_keys:
+        value = cfg[key]
+        if value and not value.startswith("/"):
+            value = "/" + value
+        cfg[key] = value
+
+    url_keys = {
+        "cloudflare_api_base", "cloudmail_api_base",
+        "grok2api_remote_base", "cpa_base_url",
+    }
+    for key in url_keys:
+        value = cfg[key]
+        if not value:
+            continue
+        parsed = urllib.parse.urlsplit(value)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ConfigError(f"配置项 {key} 必须是有效的 http/https URL")
+
+    for key in path_keys:
+        value = cfg[key]
+        if value.startswith("~"):
+            cfg[key] = os.path.expanduser(value)
     return cfg
 
 
@@ -968,11 +1000,12 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
     if token not in existing:
         pool.append({"token": token, "tags": ["auto-register"], "note": email})
     current[pool_name] = pool
+    if not etag:
+        raise RemoteTokenCompatibilityError(
+            "旧版远端接口未提供 ETag，无法保证并发安全，已拒绝全量保存"
+        )
     save_headers = dict(headers)
-    if etag:
-        save_headers["If-Match"] = etag
-    elif log_callback:
-        log_callback("[!] 旧版远端接口未提供 ETag；已由显式配置允许，但仍不建议多实例并发")
+    save_headers["If-Match"] = etag
     endpoint = f"{fallback_base}/tokens"
     try:
         response = http_post(endpoint, headers=save_headers, params=query, json=current, timeout=30)
@@ -3523,6 +3556,8 @@ class GrokRegisterGUI:
                     line = event[1]
                     self.log_text.insert(tk.END, f"{line}\n")
                     self.log_text.see(tk.END)
+                elif kind == "clear_log":
+                    self.log_text.delete(1.0, tk.END)
                 elif kind == "stats":
                     self.stats_var.set(f"成功: {event[1]} | 失败: {event[2]}")
                 elif kind == "running":
@@ -3550,7 +3585,7 @@ class GrokRegisterGUI:
         self.ui_queue.put(("log", line))
 
     def clear_log(self):
-        self.log_text.delete(1.0, tk.END)
+        self.ui_queue.put(("clear_log",))
 
     def update_stats(self):
         self.ui_queue.put(("stats", self.success_count, self.fail_count))
