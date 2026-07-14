@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - tools/apply_remaining_hardening.py
+      - tools/fix_remaining_patch_oidc_scope.py
       - .github/workflows/temp-remaining-hardening.yml
   workflow_dispatch:
 
@@ -15,13 +16,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Repair OIDC migration scope
+        run: python tools/fix_remaining_patch_oidc_scope.py
       - name: Apply source migration
         run: python tools/apply_remaining_hardening.py
       - name: Commit source changes and remove temporary files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git rm -f tools/apply_remaining_hardening.py .github/workflows/temp-remaining-hardening.yml
+          git rm -f tools/apply_remaining_hardening.py tools/fix_remaining_patch_oidc_scope.py .github/workflows/temp-remaining-hardening.yml
           git add -A
           git commit -m "fix: complete remaining registration hardening"
           git push
