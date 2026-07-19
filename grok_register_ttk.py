@@ -162,7 +162,22 @@ def _init_accounts_db(conn):
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email)")
+    _migrate_accounts_db(conn)
     conn.commit()
+
+
+def _migrate_accounts_db(conn):
+    """为旧表补齐 grok2api 推送状态列（幂等；ALTER TABLE 无 IF NOT EXISTS，需先查 PRAGMA）。"""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(accounts)")}
+    migrations = [
+        ("grok2api_local_status", "TEXT"),
+        ("grok2api_local_at", "TEXT"),
+        ("grok2api_remote_status", "TEXT"),
+        ("grok2api_remote_at", "TEXT"),
+    ]
+    for col, col_type in migrations:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE accounts ADD COLUMN {col} {col_type}")
 
 
 def _connect_accounts_db():
@@ -231,6 +246,159 @@ def save_account_to_db(
         finally:
             conn.close()
     return True
+
+
+def update_account_grok2api_status(
+    email,
+    local_status=None,
+    remote_status=None,
+    log_callback=None,
+):
+    """按 email 更新单个账号的 grok2api 推送状态。
+
+    状态取值：'success' | 'failed' | 'skipped'；仅对非 None 的字段执行 UPDATE。
+    配套的时间戳列 *_at 在对应 status 非 None 时一并写入当前时间。
+    """
+    if not email:
+        return False
+    ensure_accounts_db()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sets, params = [], []
+    if local_status is not None:
+        sets.extend(["grok2api_local_status = ?", "grok2api_local_at = ?"])
+        params.extend([local_status, now])
+    if remote_status is not None:
+        sets.extend(["grok2api_remote_status = ?", "grok2api_remote_at = ?"])
+        params.extend([remote_status, now])
+    if not sets:
+        return False
+    params.append(email)
+    with ACCOUNTS_DB_LOCK:
+        conn = _connect_accounts_db()
+        try:
+            conn.execute(
+                f"UPDATE accounts SET {', '.join(sets)} WHERE email = ?",
+                tuple(params),
+            )
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] 更新 grok2api 推送状态失败: {exc}")
+            return False
+        finally:
+            conn.close()
+    return True
+
+
+def list_accounts_with_grok2api_status(local_filter=None, remote_filter=None):
+    """查询 accounts 表，可按推送状态过滤。
+
+    local_filter / remote_filter 取 None（不过滤）、'unsuccess'（success 之外都算，
+    用于「需要重推」场景）或具体状态值（'success'/'failed'/'skipped'/NULL）。
+    返回 list[dict]，字段：email, sso_token, grok2api_local_status, grok2api_remote_status。
+    """
+    ensure_accounts_db()
+    where, params = [], []
+    if local_filter is not None:
+        if local_filter == "unsuccess":
+            where.append("(grok2api_local_status IS NULL OR grok2api_local_status != 'success')")
+        else:
+            where.append("grok2api_local_status = ?")
+            params.append(local_filter)
+    if remote_filter is not None:
+        if remote_filter == "unsuccess":
+            where.append("(grok2api_remote_status IS NULL OR grok2api_remote_status != 'success')")
+        else:
+            where.append("grok2api_remote_status = ?")
+            params.append(remote_filter)
+    sql = (
+        "SELECT email, sso_token, grok2api_local_status, grok2api_remote_status "
+        "FROM accounts"
+    )
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id"
+    rows = []
+    with ACCOUNTS_DB_LOCK:
+        conn = _connect_accounts_db()
+        try:
+            cur = conn.execute(sql, tuple(params))
+            for r in cur.fetchall():
+                rows.append(
+                    {
+                        "email": r[0],
+                        "sso_token": r[1],
+                        "grok2api_local_status": r[2],
+                        "grok2api_remote_status": r[3],
+                    }
+                )
+        finally:
+            conn.close()
+    return rows
+
+
+def repush_grok2api_for_account(email, sso_token, log_callback=None, only=None):
+    """对单个账号重推 grok2api，并把结果写回 accounts 表。
+
+    only: None=按配置推 local/remote；'local' / 'remote' 仅推该侧。
+    返回 dict: {local: bool|None, remote: bool|None}（None 表示该侧未执行）。
+    """
+    if not sso_token:
+        if log_callback:
+            log_callback(f"[!] {email}: 无 sso_token，跳过重推")
+        return {"local": None, "remote": None}
+    result = add_token_to_grok2api_pools(
+        sso_token, email=email, log_callback=log_callback, return_detail=True
+    ) or {}
+    local_done = result.get("local")
+    remote_done = result.get("remote")
+    local_status = None
+    remote_status = None
+    if only in (None, "local") and local_done is not None:
+        local_status = "success" if local_done else "failed"
+    if only in (None, "remote") and remote_done is not None:
+        remote_status = "success" if remote_done else "failed"
+    if local_status is not None or remote_status is not None:
+        update_account_grok2api_status(
+            email,
+            local_status=local_status,
+            remote_status=remote_status,
+            log_callback=log_callback,
+        )
+    return {"local": local_done, "remote": remote_done}
+
+
+def repush_grok2api_failed(log_callback=None, only=None):
+    """批量重推所有推送状态非 success 的账号。
+
+    only: None=两侧都按各自状态判定并重推；'local'/'remote' 仅处理该侧。
+    返回 dict: {attempted, local_ok, local_fail, remote_ok, remote_fail}。
+    """
+    stats = {"attempted": 0, "local_ok": 0, "local_fail": 0, "remote_ok": 0, "remote_fail": 0}
+    if only in (None, "local") and config.get("grok2api_auto_add_local", True):
+        rows = list_accounts_with_grok2api_status(local_filter="unsuccess")
+        if log_callback:
+            log_callback(f"[*] 重推本地池: 待处理 {len(rows)} 个账号")
+        for row in rows:
+            if only is None and config.get("grok2api_auto_add_remote", False) and row.get("grok2api_remote_status") != "success":
+                continue  # 两侧都推时，交给下面的 remote 分支统一处理，避免重复
+            stats["attempted"] += 1
+            r = repush_grok2api_for_account(row["email"], row["sso_token"], log_callback=log_callback, only="local")
+            if r["local"] is True:
+                stats["local_ok"] += 1
+            elif r["local"] is False:
+                stats["local_fail"] += 1
+    if only in (None, "remote") and config.get("grok2api_auto_add_remote", False):
+        rows = list_accounts_with_grok2api_status(remote_filter="unsuccess")
+        if log_callback:
+            log_callback(f"[*] 重推远端池: 待处理 {len(rows)} 个账号")
+        for row in rows:
+            stats["attempted"] += 1
+            r = repush_grok2api_for_account(row["email"], row["sso_token"], log_callback=log_callback, only="remote")
+            if r["remote"] is True:
+                stats["remote_ok"] += 1
+            elif r["remote"] is False:
+                stats["remote_fail"] += 1
+    return stats
 
 
 def ensure_stable_python_runtime():
@@ -976,19 +1144,36 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
         return False
 
 
-def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
+def add_token_to_grok2api_pools(raw_token, email="", log_callback=None, return_detail=False):
+    """将 token 推入本地/远端 grok2api 池。
+
+    return_detail=False（默认，向后兼容）：行为同旧版，无返回值。
+    return_detail=True：返回 dict，键 local / remote 取值：
+      - True/False：该侧已启用且执行完毕（成功/失败）
+      - None：该侧未启用，或 token 为空未执行
+    失败时异常被捕获并打印，不会抛出。
+    """
+    detail = {"local": None, "remote": None}
     if config.get("grok2api_auto_add_local", True):
         try:
-            add_token_to_grok2api_local_pool(raw_token, email=email, log_callback=log_callback)
+            detail["local"] = bool(
+                add_token_to_grok2api_local_pool(raw_token, email=email, log_callback=log_callback)
+            )
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] 写入 grok2api 本地池失败: {exc}")
+            detail["local"] = False
     if config.get("grok2api_auto_add_remote", False):
         try:
-            add_token_to_grok2api_remote_pool(raw_token, email=email, log_callback=log_callback)
+            detail["remote"] = bool(
+                add_token_to_grok2api_remote_pool(raw_token, email=email, log_callback=log_callback)
+            )
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] 写入 grok2api 远端池失败: {exc}")
+            detail["remote"] = False
+    if return_detail:
+        return detail
 
 
 _LINUX_BROWSER_CANDIDATES = [
@@ -3623,6 +3808,8 @@ class GrokRegisterGUI:
         self.stop_btn.pack(side=tk.LEFT, padx=5)
         self.clear_btn = tk_button(btn_frame, text="清空日志", command=self.clear_log)
         self.clear_btn.pack(side=tk.LEFT, padx=5)
+        self.repush_btn = tk_button(btn_frame, text="重推失败 token", command=self.repush_failed_grok2api)
+        self.repush_btn.pack(side=tk.LEFT, padx=5)
 
         status_frame = tk.Frame(main_frame, bg=UI_BG)
         status_frame.grid(row=2, column=0, sticky=tk.EW, pady=(0, 6))
@@ -3672,6 +3859,26 @@ class GrokRegisterGUI:
 
     def clear_log(self):
         self.log_text.delete(1.0, tk.END)
+
+    def repush_failed_grok2api(self):
+        """重推所有 grok2api 推送状态非 success 的账号（本地池 + 远端池，按配置）。"""
+        if self.is_running:
+            self.log("[!] 当前已有注册任务在运行，请先停止再重推")
+            return
+        load_config()
+        if not (config.get("grok2api_auto_add_local", True) or config.get("grok2api_auto_add_remote", False)):
+            self.log("[!] 本地池与远端池均未启用，无可重推目标")
+            return
+        self.log("[*] 开始重推 grok2api 失败 token ...")
+        try:
+            stats = repush_grok2api_failed(log_callback=self.log, only=None)
+            self.log(
+                f"[+] 重推完成: 处理 {stats['attempted']} 个 | "
+                f"本地 成功 {stats['local_ok']} 失败 {stats['local_fail']} | "
+                f"远端 成功 {stats['remote_ok']} 失败 {stats['remote_fail']}"
+            )
+        except Exception as exc:
+            self.log(f"[!] 重推异常: {exc}")
 
     def update_stats(self):
         self.stats_var.set(f"成功: {self.success_count} | 失败: {self.fail_count}")
@@ -3849,7 +4056,25 @@ class GrokRegisterGUI:
                         email_provider=provider,
                         log_callback=self.log,
                     )
-                    add_token_to_grok2api_pools(sso, email=email, log_callback=self.log)
+                    push_detail = add_token_to_grok2api_pools(
+                        sso, email=email, log_callback=self.log, return_detail=True
+                    ) or {}
+                    local_status = (
+                        "success" if push_detail.get("local") is True
+                        else "failed" if push_detail.get("local") is False
+                        else "skipped"
+                    ) if push_detail.get("local") is not None else None
+                    remote_status = (
+                        "success" if push_detail.get("remote") is True
+                        else "failed" if push_detail.get("remote") is False
+                        else "skipped"
+                    ) if push_detail.get("remote") is not None else None
+                    update_account_grok2api_status(
+                        email,
+                        local_status=local_status,
+                        remote_status=remote_status,
+                        log_callback=self.log,
+                    )
                     self.success_count += 1
                     retry_count_for_slot = 0
                     i += 1
@@ -4019,7 +4244,25 @@ def run_registration_cli(count):
                     email_provider=provider,
                     log_callback=cli_log,
                 )
-                add_token_to_grok2api_pools(sso, email=email, log_callback=cli_log)
+                push_detail = add_token_to_grok2api_pools(
+                    sso, email=email, log_callback=cli_log, return_detail=True
+                ) or {}
+                local_status = (
+                    "success" if push_detail.get("local") is True
+                    else "failed" if push_detail.get("local") is False
+                    else "skipped"
+                ) if push_detail.get("local") is not None else None
+                remote_status = (
+                    "success" if push_detail.get("remote") is True
+                    else "failed" if push_detail.get("remote") is False
+                    else "skipped"
+                ) if push_detail.get("remote") is not None else None
+                update_account_grok2api_status(
+                    email,
+                    local_status=local_status,
+                    remote_status=remote_status,
+                    log_callback=cli_log,
+                )
                 success_count += 1
                 retry_count_for_slot = 0
                 i += 1
@@ -4069,6 +4312,34 @@ def run_registration_cli(count):
     return success_count, fail_count
 
 
+def main_cli_repush(args=None):
+    """CLI 子命令：重推 grok2api 推送失败的 token。不启动浏览器。"""
+    load_config()
+    only = getattr(args, "repush_only", None) if args is not None else None
+    if only in ("local", "remote"):
+        cli_log(f"[*] 重推模式: 仅 {only} 池")
+    else:
+        only = None
+        cli_log("[*] 重推模式: 按配置处理 local + remote")
+    if not config.get("grok2api_auto_add_local", True) and not config.get("grok2api_auto_add_remote", False):
+        cli_log("[!] 本地池与远端池均未启用，无可重推目标")
+        sys.exit(2)
+    ensure_accounts_db()
+    cli_log(f"[*] 数据库: {ACCOUNTS_DB_FILE}")
+    try:
+        stats = repush_grok2api_failed(log_callback=cli_log, only=only)
+    except Exception as exc:
+        cli_log(f"[!] 重推异常: {exc}")
+        sys.exit(1)
+    cli_log(
+        f"[+] 重推完成: 处理 {stats['attempted']} 个 | "
+        f"本地 成功 {stats['local_ok']} 失败 {stats['local_fail']} | "
+        f"远端 成功 {stats['remote_ok']} 失败 {stats['remote_fail']}"
+    )
+    failed = stats["local_fail"] + stats["remote_fail"]
+    sys.exit(0 if failed == 0 else 1)
+
+
 def main_cli(args=None):
     load_config()
     if args is not None and args.count is not None:
@@ -4104,19 +4375,22 @@ def main_cli(args=None):
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         prog="grok_register_ttk.py",
-        description="Grok 注册机。不带参数启动 GUI；cli/start/--cli 或 -n/-y 进入 CLI 模式。",
+        description=(
+            "Grok 注册机。不带参数启动 GUI；cli/start/--cli 或 -n/-y 进入 CLI 注册；"
+            "repush 进入重推 grok2api 失败 token 子命令。"
+        ),
     )
     parser.add_argument(
         "mode",
         nargs="?",
         default=None,
-        help="CLI 模式：cli 或 start（等价）。省略则进入 GUI（除非带了 -n/-y）。",
+        help="cli/start=注册；repush=重推 grok2api 失败 token。省略则进入 GUI（除非带了 -n/-y）。",
     )
     parser.add_argument(
         "--cli",
         dest="cli_flag",
         action="store_true",
-        help="等价于位置参数 cli，进入 CLI 模式。",
+        help="等价于位置参数 cli，进入 CLI 注册模式。",
     )
     parser.add_argument(
         "-n",
@@ -4134,12 +4408,22 @@ def build_arg_parser():
         action="store_true",
         help="非交互模式，跳过 start 确认，适合 crontab。stdin 非 tty 时自动启用。",
     )
+    parser.add_argument(
+        "--only",
+        dest="repush_only",
+        choices=["local", "remote"],
+        default=None,
+        help="repush 子命令专用：仅重推本地池或远端池。省略则按配置两侧都处理。",
+    )
     return parser
 
 
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.mode == "repush":
+        main_cli_repush(args)
+        return
     enter_cli = (
         args.mode in ("cli", "start")
         or args.cli_flag
